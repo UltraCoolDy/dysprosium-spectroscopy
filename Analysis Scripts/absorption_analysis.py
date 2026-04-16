@@ -2380,6 +2380,13 @@ def save_summary_text(
         lines.append("------------")
         lines.append(f"Valid scans: {len(processed)}")
 
+        # Scan centre frequency from the fitted peak centres
+        if physics_df is not None and not physics_df.empty:
+            centre_vals = pd.to_numeric(physics_df["centre_thz"], errors="coerce").dropna()
+            if len(centre_vals) > 0:
+                scan_centre_thz = float(np.mean(centre_vals))
+                lines.append(f"Scan centre frequency: {scan_centre_thz:.6f} THz")
+
         if per_ramp_analysis is not None:
             per_ramp_summary_df = per_ramp_analysis.get("per_ramp_summary_df")
             if per_ramp_summary_df is not None and not per_ramp_summary_df.empty:
