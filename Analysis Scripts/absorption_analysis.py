@@ -45,6 +45,9 @@ class AnalysisConfig:
     display_savgol_window: int = 3
     display_savgol_poly: int = 1
 
+    avg_baseline_poly_order: int = 2
+    avg_baseline_exclude_half_width_thz: float = 8e-5
+
     peak_detect_window: int = 31
     peak_detect_poly: int = 2
     peak_threshold_sigma: float = 0.5
@@ -629,6 +632,74 @@ def average_ramps_to_common_axis(processed: List[Dict[str, Any]], cfg: AnalysisC
         "od_mean_s": od_mean_s,
         "diff_mean_s": diff_mean_s,
     }
+
+def correct_average_baseline(
+    avg: Dict[str, Any],
+    peak_positions_thz: Optional[List[float]],
+    cfg: AnalysisConfig,
+) -> Dict[str, Any]:
+    """
+    Remove slow baseline curvature from the averaged ratio/OD/diff traces using a
+    low-order polynomial fit, excluding regions around the detected peaks.
+    """
+    x = np.asarray(avg["common_x"], dtype=float)
+
+    if peak_positions_thz is None:
+        peak_positions_thz = []
+
+    peak_positions_thz = [float(v) for v in peak_positions_thz if np.isfinite(v)]
+
+    baseline_mask = np.isfinite(x)
+    for x0 in peak_positions_thz:
+        baseline_mask &= np.abs(x - x0) > cfg.avg_baseline_exclude_half_width_thz
+
+    # Fallback to edges if too many points are excluded
+    if np.sum(baseline_mask) < 20:
+        n_edge = max(20, len(x) // 10)
+        baseline_mask = np.zeros_like(x, dtype=bool)
+        baseline_mask[:n_edge] = True
+        baseline_mask[-n_edge:] = True
+
+    def _correct_one(y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        y = np.asarray(y, dtype=float)
+        good = np.isfinite(x) & np.isfinite(y) & baseline_mask
+
+        if np.sum(good) < 10:
+            baseline = np.full_like(y, np.nanmedian(y))
+            y_corr = y - baseline + np.nanmedian(baseline)
+            return y_corr, baseline
+
+        x_ref = float(np.mean(x[good]))
+        coeff = np.polyfit(x[good] - x_ref, y[good], cfg.avg_baseline_poly_order)
+        baseline = np.polyval(coeff, x - x_ref)
+
+        # Preserve approximate overall level
+        baseline_offset = float(np.nanmedian(baseline[good]))
+        y_corr = y - baseline + baseline_offset
+        return y_corr, baseline
+
+    ratio_mean_corr, ratio_baseline = _correct_one(avg["ratio_mean"])
+    od_mean_corr, od_baseline = _correct_one(avg["od_mean"])
+    diff_mean_corr, diff_baseline = _correct_one(avg["diff_mean"])
+
+    win = odd_window(cfg.display_savgol_window, len(x))
+    poly = min(cfg.display_savgol_poly, win - 1)
+
+    avg_out = dict(avg)
+    avg_out["ratio_mean"] = ratio_mean_corr
+    avg_out["od_mean"] = od_mean_corr
+    avg_out["diff_mean"] = diff_mean_corr
+
+    avg_out["ratio_mean_s"] = savgol_filter(ratio_mean_corr, win, poly)
+    avg_out["od_mean_s"] = savgol_filter(od_mean_corr, win, poly)
+    avg_out["diff_mean_s"] = savgol_filter(diff_mean_corr, win, poly)
+
+    avg_out["ratio_baseline_poly"] = ratio_baseline
+    avg_out["od_baseline_poly"] = od_baseline
+    avg_out["diff_baseline_poly"] = diff_baseline
+    avg_out["baseline_mask"] = baseline_mask
+
+    return avg_out
 
 def single_ramp_to_avg_like(ramp: Dict[str, Any], cfg: AnalysisConfig, common_x: np.ndarray) -> Dict[str, Any]:
     """
@@ -2483,6 +2554,16 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
         ))
 
     avg = average_ramps_to_common_axis(processed, cfg)
+
+    # First-pass detection on the raw averaged traces
+    candidates, strong_peaks, peak_diag = detect_strong_peaks(avg, cfg)
+    best_spacing_match, isotope_assignment = match_isotopes(strong_peaks, cfg)
+
+    # Use first-pass peak positions to remove any slow curved baseline from the averaged traces
+    peak_positions_thz = [p["x"] for p in strong_peaks]
+    avg = correct_average_baseline(avg, peak_positions_thz, cfg)
+
+    # Re-run detection and assignment on the baseline-corrected averaged traces
     candidates, strong_peaks, peak_diag = detect_strong_peaks(avg, cfg)
     best_spacing_match, isotope_assignment = match_isotopes(strong_peaks, cfg)
 
