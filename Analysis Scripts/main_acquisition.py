@@ -21,16 +21,15 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tessera
 # ============================================================
 # USER SETTINGS
 # ============================================================
-SCOPE_ADDR = "TCPIP0::192.168.20.20::inst0::INSTR"
+SCOPE_ADDR = "TCPIP0::192.168.20.21::inst0::INSTR"
 
 WAVEMETER_HOST = "192.168.20.11"
 WAVEMETER_PORT = 7802
-WAVEMETER_SWITCH_PORT = 4
+WAVEMETER_SWITCH_PORT = 4 #Wavemeter port labels - 421 = 1, 626 = 3, 842 = 4
 WAVEMETER_CMD = "WAVElength\n"
 WAVEMETER_TIMEOUT_S = 0.15
 
-OUTPUT_DIR = Path("combined_acq_full")
-OUTPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR = Path("data_acq")
 
 SCOPE_TIMEOUT_MS = 20000
 POST_SHOT_EXTRA_WAIT_S = 0.5
@@ -43,6 +42,12 @@ HL_IMG = (1350, 250, 1540, 300)
 TRIG_SOURCE = "CH4"
 TRIG_SLOPE = "FALL"
 TRIG_LEVEL = 0.282
+
+# Quality check thresholds
+QC_JITTER_MAX_MHZ = 8.0    # flag if per-ramp jitter exceeds this
+QC_BASELINE_MAX   = 0.001  # flag if probe/ref off-resonance std exceeds this
+QC_MIN_RAMPS      = 20     # flag if fewer valid ramps than this
+QC_MIN_PEAK_OD    = 0.003  # flag if peak OD below this (weak/no signal)
 
 # ============================================================
 # WAVEMETER HELPERS
@@ -204,6 +209,7 @@ def get_oven_temps():
 # SCOPE HELPERS
 # ============================================================
 def read_scope_channel(scope, channel: str):
+    t0 = time.perf_counter()
     scope.write(f"DATA:SOURCE {channel}")
     scope.write("DATA:ENCDG SRIBINARY")
     scope.write("DATA:WIDTH 2")
@@ -223,6 +229,8 @@ def read_scope_channel(scope, channel: str):
     volts = (raw - yoff) * ymult + yzero
     time_axis = xzero + (np.arange(len(raw)) - ptoff) * xincr
 
+    print(f"  {channel}: {len(raw)} samples  ({time.perf_counter()-t0:.2f}s)")
+
     return {
         "time": time_axis,
         "volts": volts,
@@ -237,19 +245,162 @@ def read_scope_channel(scope, channel: str):
 
 
 # ============================================================
+# QUALITY CHECK
+# ============================================================
+def quick_quality_check(scope_npz: Path, wavemeter_csv: Path, dataset_stem: str):
+    """
+    Lightweight post-acquisition quality check.
+    Checks ramp count, frequency jitter, and probe/ref baseline stability.
+    No files saved — prints PASS/FAIL to console only.
+    """
+    try:
+        import sys
+        analysis_dir = Path(__file__).resolve().parent
+        if str(analysis_dir) not in sys.path:
+            sys.path.insert(0, str(analysis_dir))
+
+        from absorption_analysis import (
+            AnalysisConfig, load_scope_npz, load_wavemeter_csv,
+            align_and_interpolate_frequency, prepare_binned_scope,
+            detect_rising_ramps, process_rising_ramp,
+            average_ramps_to_common_axis, correct_average_baseline,
+            detect_strong_peaks, default_expected_peaks,
+        )
+
+        t0 = time.perf_counter()
+
+        cfg = AnalysisConfig(
+            scope_file=str(scope_npz),
+            wavemeter_file=str(wavemeter_csv),
+            output_dir=str(scope_npz.parent.parent),
+            save_plots=False,
+            show_plots=False,
+            save_per_ramp_fits=False,
+            debug=False,
+            expected_peak_positions_thz=default_expected_peaks(),
+        )
+
+        scope   = load_scope_npz(cfg.scope_file)
+        wm_ok   = load_wavemeter_csv(cfg.wavemeter_file)
+        align   = align_and_interpolate_frequency(scope, wm_ok, cfg)
+        prepared = prepare_binned_scope(scope, align["freq_interp_raw"], cfg)
+        _, ramp_slices = detect_rising_ramps(prepared["t"], prepared["scan"], cfg)
+
+        processed = []
+        for r in ramp_slices:
+            try:
+                processed.append(process_rising_ramp(
+                    prepared["t"][r], prepared["scan"][r],
+                    prepared["freq_interp"][r], prepared["probe"][r],
+                    prepared["ref"][r],
+                    edge_fraction=cfg.edge_fraction,
+                    eps=cfg.eps, max_shift=cfg.max_shift,
+                ))
+            except RuntimeError:
+                continue
+
+        n_ramps    = len(processed)
+        jitter_mhz = float("nan")
+        peak_od    = float("nan")
+        baseline_std = float("nan")
+
+        if n_ramps >= 3:
+            avg = average_ramps_to_common_axis(processed, cfg)
+            try:
+                _, strong_peaks, _ = detect_strong_peaks(avg, cfg)
+                avg = correct_average_baseline(avg, [p["x"] for p in strong_peaks], cfg)
+                _, strong_peaks, _ = detect_strong_peaks(avg, cfg)
+                if strong_peaks:
+                    peak_od = float(strong_peaks[0].get("peak_od", float("nan")))
+                    target  = strong_peaks[0]["x"]
+                    centres = []
+                    for ramp in processed:
+                        window = np.abs(ramp["freq"] - target) < 5e-5
+                        if np.sum(window) > 5:
+                            centres.append(float(
+                                ramp["freq"][window][np.argmax(ramp["od_corr"][window])]
+                            ))
+                    if len(centres) >= 3:
+                        jitter_mhz = float(np.std(centres) * 1e6)
+            except Exception:
+                pass
+
+            # Baseline stability: std of mean off-resonance ratio across ramps
+            edge_ratios = []
+            for ramp in processed:
+                r = ramp["ratio_corr"]
+                n_edge = max(10, len(r) // 10)
+                edge_ratios.append(float(np.mean(np.r_[r[:n_edge], r[-n_edge:]])))
+            baseline_std = float(np.std(edge_ratios))
+
+        elapsed = time.perf_counter() - t0
+
+        W = 52
+        print("\n" + "=" * W)
+        print(f"  ACQUISITION QUALITY CHECK")
+        print(f"  {dataset_stem}")
+        print("=" * W)
+
+        def _row(label, value_str, ok):
+            print(f"  {label:<22} {value_str:<14} {'✓' if ok else '✗'}")
+
+        ramps_ok    = n_ramps >= QC_MIN_RAMPS
+        jitter_ok   = np.isfinite(jitter_mhz) and jitter_mhz <= QC_JITTER_MAX_MHZ
+        baseline_ok = np.isfinite(baseline_std) and baseline_std <= QC_BASELINE_MAX
+        od_ok       = np.isfinite(peak_od) and peak_od >= QC_MIN_PEAK_OD
+
+        _row("Valid ramps",    str(n_ramps),                                     ramps_ok)
+        _row("Jitter",         f"{jitter_mhz:.1f} MHz" if np.isfinite(jitter_mhz) else "—", jitter_ok)
+        _row("Baseline drift", f"{baseline_std:.4f}"   if np.isfinite(baseline_std) else "—", baseline_ok)
+        _row("Peak OD",        f"{peak_od:.4f}"        if np.isfinite(peak_od) else "—",       od_ok)
+
+        print("-" * W)
+        if ramps_ok and jitter_ok and baseline_ok and od_ok:
+            print(f"  RESULT: ✓  PASS — good to proceed")
+        else:
+            reasons = []
+            if not ramps_ok:    reasons.append(f"only {n_ramps} ramps")
+            if not jitter_ok:   reasons.append(f"laser drift ({jitter_mhz:.1f} MHz)")
+            if not baseline_ok: reasons.append(f"probe/ref drift ({baseline_std:.4f})")
+            if not od_ok:       reasons.append(f"weak signal (OD={peak_od:.4f})")
+            print(f"  RESULT: ✗  RETAKE RECOMMENDED")
+            for r in reasons:
+                print(f"           → {r}")
+        print(f"  (check took {elapsed:.1f}s)")
+        print("=" * W + "\n")
+
+    except Exception as exc:
+        print(f"\n[quality check] failed: {exc}")
+        print("[quality check] skipping — check data manually\n")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
+    t_main = time.perf_counter()
+
     ec_temp, hl_temp = get_oven_temps()
-    run_basename = f"{time.strftime('%Y%m%d_%H%M%S')}_EC{ec_temp}_HL{hl_temp}_full"
     print(f"Oven temps grabbed: EC={ec_temp}, HL={hl_temp}")
 
-    scope_npz = OUTPUT_DIR / f"{run_basename}_scope_all.npz"
-    wavemeter_csv = OUTPUT_DIR / f"{run_basename}_wavemeter.csv"
+    # Build date-hierarchical folder: data_acq/YYYY-MM/DD/dataset_stem/raw/
+    date_year_month = time.strftime("%Y-%m")
+    date_day        = time.strftime("%d")
+    dataset_stem    = f"{time.strftime('%Y%m%d_%H%M%S')}_EC{ec_temp}_HL{hl_temp}"
 
-    wm_rows = []
+    dataset_dir = OUTPUT_DIR / date_year_month / date_day / dataset_stem
+    raw_dir     = dataset_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    scope_npz     = raw_dir / f"{dataset_stem}_full_scope_all.npz"
+    wavemeter_csv = raw_dir / f"{dataset_stem}_full_wavemeter.csv"
+
+    print(f"Dataset: {dataset_stem}")
+    print(f"Raw dir: {raw_dir}")
+
+    wm_rows   = []
     wm_status = {}
-    wm_stop = threading.Event()
+    wm_stop   = threading.Event()
 
     print("Starting wavemeter logger...")
     wm_thread = threading.Thread(
@@ -260,12 +411,12 @@ def main():
     wm_thread.start()
     time.sleep(0.5)
 
-    rm = pyvisa.ResourceManager()
+    rm    = pyvisa.ResourceManager()
     scope = rm.open_resource(SCOPE_ADDR)
 
-    scope.timeout = SCOPE_TIMEOUT_MS
-    scope.encoding = "latin_1"
-    scope.read_termination = "\n"
+    scope.timeout           = SCOPE_TIMEOUT_MS
+    scope.encoding          = "latin_1"
+    scope.read_termination  = "\n"
     scope.write_termination = "\n"
 
     print("Connected to scope:", scope.query("*IDN?").strip())
@@ -283,7 +434,7 @@ def main():
     rmgr = Client()
     rmgr.set_run_shots(True)
 
-    t_shot_launch_pc = time.time()
+    t_shot_launch_pc      = time.time()
     t_shot_launch_perf_ns = time.perf_counter_ns()
 
     print("Triggering labscript shot...")
@@ -296,12 +447,12 @@ def main():
             break
         time.sleep(0.2)
 
-    print("Scope acquisition complete")
+    print(f"Scope acquisition complete  ({time.perf_counter()-t_main:.1f}s from start)")
     time.sleep(POST_SHOT_EXTRA_WAIT_S)
 
     wm_stop.set()
     wm_thread.join(timeout=2.0)
-    print("Wavemeter logger stopped")
+    print(f"Wavemeter logger stopped  ({len(wm_rows)} samples)")
 
     time_div = float(scope.query("HORIZONTAL:SCALE?"))
     try:
@@ -309,11 +460,15 @@ def main():
     except Exception:
         sample_rate = np.nan
 
+    print("Reading scope channels...")
+    t_read = time.perf_counter()
     ch1 = read_scope_channel(scope, "CH1")
     ch2 = read_scope_channel(scope, "CH2")
     ch3 = read_scope_channel(scope, "CH3")
     ch4 = read_scope_channel(scope, "CH4")
+    print(f"  Total readout: {time.perf_counter()-t_read:.2f}s")
 
+    t_save = time.perf_counter()
     np.savez(
         scope_npz,
         t_shot_launch_pc=t_shot_launch_pc,
@@ -322,14 +477,11 @@ def main():
         sample_rate=sample_rate,
         ec_temp=ec_temp,
         hl_temp=hl_temp,
-
         time=ch1["time"],
-
         ch1=ch1["volts"],
         ch2=ch2["volts"],
         ch3=ch3["volts"],
         ch4=ch4["volts"],
-
         record_length=ch1["record_length"],
         xincr=ch1["xincr"],
         xzero=ch1["xzero"],
@@ -338,12 +490,14 @@ def main():
     print(f"Saved scope data: {scope_npz}")
 
     save_wavemeter_csv(wm_rows, wavemeter_csv)
-    print(f"Saved wavemeter data: {wavemeter_csv}")
-    print("Wavemeter status:", wm_status)
-    print(f"Wavemeter samples collected: {len(wm_rows)}")
+    print(f"Saved wavemeter data: {wavemeter_csv}  ({time.perf_counter()-t_save:.2f}s)")
 
     scope.close()
     rm.close()
+
+    print(f"\nTotal acquisition time: {time.perf_counter()-t_main:.1f}s")
+
+    quick_quality_check(scope_npz, wavemeter_csv, dataset_stem)
 
 
 if __name__ == "__main__":

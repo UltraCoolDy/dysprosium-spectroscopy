@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -9,8 +10,7 @@ from absorption_analysis import AnalysisConfig, analyze, config_from_json, defau
 # ============================================================
 # USER SETTINGS
 # ============================================================
-# Point this to your acquisition folder.
-ACQ_FOLDER = Path(r"C:\Users\dysprosium\labscript-suite\userlib\labscriptlib\quantum_gas_microscope\Dysprosium\Spectroscopy\combined_acq_full")
+ACQ_FOLDER = Path(r"C:\Users\dysprosium\labscript-suite\userlib\labscriptlib\quantum_gas_microscope\Dysprosium\Spectroscopy\data_acq")
 
 # Optional config file. Set to None to use built-in defaults.
 CONFIG_JSON: Optional[Path] = Path(__file__).resolve().parent / "absorption_config.json"
@@ -50,6 +50,8 @@ def load_cfg_template() -> Dict:
         "start_backtrack_blocks": 1,
         "end_trim_blocks": 1,
         "drop_edge_ramps": True,
+        "avg_baseline_poly_order": 2,
+        "avg_baseline_exclude_half_width_thz": 8e-5,
         "edge_fraction": 0.12,
         "eps": 1e-12,
         "max_shift": 8,
@@ -154,47 +156,55 @@ def find_datasets(folder: Path) -> List[Dict]:
     if not folder.exists():
         raise FileNotFoundError(f"Acquisition folder does not exist: {folder}")
 
-    # First, move any loose input pairs into their own folders
-    organize_loose_datasets(folder)
-
     datasets: List[Dict] = []
 
-    # Look for dataset folders named like:
-    # YYYYMMDD_HHMMSS
-    # or
-    # YYYYMMDD_HHMMSS_EC1020_HL1091
-    for dataset_dir in sorted([p for p in folder.iterdir() if p.is_dir()]):
+    def _check_dataset_dir(dataset_dir: Path) -> None:
         prefix = dataset_dir.name
 
-        scope_files = sorted(dataset_dir.glob("*_full_scope_all.npz"))
-        wavemeter_files = sorted(dataset_dir.glob("*_full_wavemeter.csv"))
+        # New structure: raw files in raw/ subfolder
+        raw_dir = dataset_dir / "raw"
+        if raw_dir.exists():
+            scope_files    = sorted(raw_dir.glob("*_full_scope_all.npz"))
+            wavemeter_files = sorted(raw_dir.glob("*_full_wavemeter.csv"))
+        else:
+            # Backward compatibility: raw files directly in dataset_dir
+            scope_files    = sorted(dataset_dir.glob("*_full_scope_all.npz"))
+            wavemeter_files = sorted(dataset_dir.glob("*_full_wavemeter.csv"))
 
         if len(scope_files) != 1 or len(wavemeter_files) != 1:
-            continue
+            return
 
         npz = scope_files[0]
         csv = wavemeter_files[0]
 
-        summary = dataset_dir / f"{prefix}_summary.txt"
-        strong_csv = dataset_dir / f"{prefix}_strong_peaks.csv"
-        fit_csv = dataset_dir / f"{prefix}_fit_results.csv"
         done_flag = dataset_dir / f"{prefix}_DONE.txt"
-
-        analyzed = done_flag.exists()
-
+        analyzed  = done_flag.exists()
         ec_temp, hl_temp = extract_temperatures_from_name(npz.stem)
 
-        datasets.append(
-            {
-                "stem": prefix,
-                "scope": npz,
-                "wavemeter": csv,
-                "folder": dataset_dir,
-                "analyzed": analyzed,
-                "ec_temp": ec_temp,
-                "hl_temp": hl_temp,
-            }
-        )
+        datasets.append({
+            "stem":      prefix,
+            "scope":     npz,
+            "wavemeter": csv,
+            "folder":    dataset_dir,
+            "analyzed":  analyzed,
+            "ec_temp":   ec_temp,
+            "hl_temp":   hl_temp,
+        })
+
+    for item in sorted(folder.iterdir()):
+        if not item.is_dir():
+            continue
+        # New structure: YYYY-MM / DD / dataset_stem
+        if re.match(r"^\d{4}-\d{2}$", item.name):
+            for day_dir in sorted(item.iterdir()):
+                if not day_dir.is_dir():
+                    continue
+                for dataset_dir in sorted(day_dir.iterdir()):
+                    if dataset_dir.is_dir():
+                        _check_dataset_dir(dataset_dir)
+        else:
+            # Old flat structure — dataset folder directly in ACQ_FOLDER
+            _check_dataset_dir(item)
 
     datasets.sort(key=lambda d: d["stem"])
     return datasets
@@ -219,6 +229,9 @@ def build_cfg(dataset: Dict) -> AnalysisConfig:
         start_backtrack_blocks=t.get("start_backtrack_blocks", 1),
         end_trim_blocks=t.get("end_trim_blocks", 1),
         drop_edge_ramps=t.get("drop_edge_ramps", True),
+        avg_baseline_poly_order=t.get("avg_baseline_poly_order", 2),
+        avg_baseline_exclude_half_width_thz=t.get("avg_baseline_exclude_half_width_thz", 8e-5),
+        use_falling_ramps=t.get("use_falling_ramps", False),
         edge_fraction=t.get("edge_fraction", 0.12),
         eps=t.get("eps", 1e-12),
         max_shift=t.get("max_shift", 8),

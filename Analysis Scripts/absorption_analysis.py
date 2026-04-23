@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -37,6 +36,7 @@ class AnalysisConfig:
     start_backtrack_blocks: int = 1
     end_trim_blocks: int = 1
     drop_edge_ramps: bool = True
+    use_falling_ramps: bool = False
 
     edge_fraction: float = 0.12
     eps: float = 1e-12
@@ -265,6 +265,113 @@ def norm_sig(y: np.ndarray) -> np.ndarray:
     return (yy - mu) / sd
 
 
+def _interpolate_and_clean_freq(
+    t_scope_in_wm: np.ndarray,
+    t_raw: np.ndarray,
+    scan_raw: np.ndarray,
+    wm_t: np.ndarray,
+    wm_f: np.ndarray,
+    freq_clean_kernel: int,
+) -> np.ndarray:
+    """
+    Given a time array mapped into wavemeter time (t_scope_in_wm), interpolate
+    the wavemeter frequency onto the scope timebase, clean outliers, and smooth.
+    Extracted as a helper so it can be called for both rising and falling shifts.
+    """
+    freq_interp = np.full_like(t_scope_in_wm, np.nan, dtype=float)
+    valid = (t_scope_in_wm >= wm_t.min()) & (t_scope_in_wm <= wm_t.max())
+    freq_interp[valid] = np.interp(t_scope_in_wm[valid], wm_t, wm_f)
+
+    f = freq_interp.copy()
+    valid_sf = np.isfinite(f) & np.isfinite(scan_raw)
+    f_valid = f[valid_sf]
+    scan_valid = scan_raw[valid_sf]
+    t_valid = t_raw[valid_sf]
+
+    a, b = np.polyfit(scan_valid, f_valid, 1)
+    f_model = a * scan_valid + b
+
+    resid = f_valid - f_model
+    med = np.nanmedian(resid)
+    mad = np.nanmedian(np.abs(resid - med))
+    threshold = 8 * mad if mad > 0 else np.inf
+
+    bad = np.abs(resid - med) > threshold
+    bad = np.convolve(bad.astype(int), np.ones(5), mode="same") > 0
+
+    good = ~bad
+    if np.sum(good) > 10 and np.any(bad):
+        f_valid[bad] = np.interp(t_valid[bad], t_valid[good], f_valid[good])
+
+    f_clean = np.full_like(f, np.nan)
+    f_clean[valid_sf] = f_valid
+
+    kernel_len = odd_window(freq_clean_kernel, len(f_clean))
+    kernel = np.ones(kernel_len)
+    valid2 = np.isfinite(f_clean)
+    num = np.convolve(np.where(valid2, f_clean, 0.0), kernel, mode="same")
+    den = np.convolve(valid2.astype(float), kernel, mode="same")
+    return num / den
+
+
+def _find_best_shift(
+    t_scope_in_wm_guess: np.ndarray,
+    scan_n: np.ndarray,
+    wm_t: np.ndarray,
+    wm_f: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+) -> Tuple[float, float]:
+    """
+    Search for the time shift that maximises correlation between normalised scan
+    voltage and interpolated wavemeter frequency.
+
+    Uses a two-stage coarse+fine search on downsampled scope data for speed:
+    - Downsample scope to ~3000 points (correlation doesn't need full resolution)
+    - Coarse search: 81 steps over ±0.4 s
+    - Fine search: 81 steps over ±(coarse_step) around coarse best
+    Returns (best_shift, best_score).
+    """
+    # Downsample for speed — correlation only needs ~1 ms precision
+    n = len(t_scope_in_wm_guess)
+    stride = max(1, n // 3000)
+    t_ds   = t_scope_in_wm_guess[::stride]
+    scan_ds = scan_n[::stride]
+    mask_ds = mask[::stride] if mask is not None else None
+
+    def _score_at(dt: float) -> float:
+        t_test = t_ds + dt
+        f_test = np.full_like(t_test, np.nan, dtype=float)
+        m = (t_test >= wm_t.min()) & (t_test <= wm_t.max())
+        f_test[m] = np.interp(t_test[m], wm_t, wm_f)
+        f_n = norm_sig(f_test)
+        good = np.isfinite(scan_ds) & np.isfinite(f_n)
+        if mask_ds is not None:
+            good = good & mask_ds
+        if np.sum(good) < 50:
+            return -np.inf
+        return float(np.corrcoef(scan_ds[good], f_n[good])[0, 1])
+
+    # Coarse search over ±0.4 s
+    coarse_grid = np.linspace(-0.4, 0.4, 81)
+    coarse_scores = np.array([_score_at(dt) for dt in coarse_grid])
+    best_coarse_idx = int(np.argmax(coarse_scores))
+    best_coarse = coarse_grid[best_coarse_idx]
+    coarse_step = coarse_grid[1] - coarse_grid[0]
+
+    # Fine search ±1 coarse step around the best coarse point
+    fine_grid = np.linspace(
+        best_coarse - coarse_step,
+        best_coarse + coarse_step,
+        81,
+    )
+    fine_scores = np.array([_score_at(dt) for dt in fine_grid])
+    best_fine_idx = int(np.argmax(fine_scores))
+
+    best_shift = float(fine_grid[best_fine_idx])
+    best_score = float(fine_scores[best_fine_idx])
+    return best_shift, best_score
+
+
 def align_and_interpolate_frequency(scope: Dict[str, Any], wm_ok: pd.DataFrame, cfg: AnalysisConfig) -> Dict[str, np.ndarray | float]:
     t_raw = scope["t"]
     ttl_raw = scope["ttl"]
@@ -289,74 +396,57 @@ def align_and_interpolate_frequency(scope: Dict[str, Any], wm_ok: pd.DataFrame, 
 
     scan_n = norm_sig(scan_raw)
 
-    shift_grid = np.linspace(-0.4, 0.4, 801)
-    best_shift = 0.0
-    best_score = -np.inf
+    # --- Global shift (rising ramps dominate, used for rising ramp processing) ---
+    # Restrict correlation search to rising segments of the scan voltage
+    dscan = np.gradient(scan_raw)
+    rising_mask = dscan > 0
 
-    for dt in shift_grid:
-        t_test = t_scope_in_wm_guess + dt
-        f_test = np.full_like(t_test, np.nan, dtype=float)
-        m = (t_test >= wm_t.min()) & (t_test <= wm_t.max())
-        f_test[m] = np.interp(t_test[m], wm_t, wm_f)
+    best_shift, best_score = _find_best_shift(
+        t_scope_in_wm_guess, scan_n, wm_t, wm_f, mask=rising_mask
+    )
 
-        f_n = norm_sig(f_test)
-        good = np.isfinite(scan_n) & np.isfinite(f_n)
-        if np.sum(good) < 100:
-            continue
+    # --- Falling-specific shift (only needed when use_falling_ramps=True) ---
+    falling_mask = dscan < 0
+    if cfg.use_falling_ramps:
+        best_shift_falling, best_score_falling = _find_best_shift(
+            t_scope_in_wm_guess, scan_n, wm_t, wm_f, mask=falling_mask
+        )
+    else:
+        # Reuse rising shift — freq_interp_raw_falling won't be used
+        best_shift_falling = best_shift
+        best_score_falling = best_score
 
-        score = np.corrcoef(scan_n[good], f_n[good])[0, 1]
-        if np.isfinite(score) and score > best_score:
-            best_score = float(score)
-            best_shift = float(dt)
+    # Build frequency arrays for both shifts
+    freq_interp_raw = _interpolate_and_clean_freq(
+        t_scope_in_wm_guess + best_shift,
+        t_raw, scan_raw, wm_t, wm_f,
+        cfg.freq_clean_kernel,
+    )
 
-    t_scope_in_wm_raw = t_scope_in_wm_guess + best_shift
-
-    freq_interp_raw = np.full_like(t_scope_in_wm_raw, np.nan, dtype=float)
-    valid = (t_scope_in_wm_raw >= wm_t.min()) & (t_scope_in_wm_raw <= wm_t.max())
-    freq_interp_raw[valid] = np.interp(t_scope_in_wm_raw[valid], wm_t, wm_f)
-
-    # single cleanup pass using scan-frequency consistency
-    f = freq_interp_raw.copy()
-    valid_sf = np.isfinite(f) & np.isfinite(scan_raw)
-    f_valid = f[valid_sf]
-    scan_valid = scan_raw[valid_sf]
-    t_valid = t_raw[valid_sf]
-
-    a, b = np.polyfit(scan_valid, f_valid, 1)
-    f_model = a * scan_valid + b
-
-    resid = f_valid - f_model
-    med = np.nanmedian(resid)
-    mad = np.nanmedian(np.abs(resid - med))
-    threshold = 8 * mad if mad > 0 else np.inf
-
-    bad = np.abs(resid - med) > threshold
-    bad = np.convolve(bad.astype(int), np.ones(5), mode="same") > 0
-
-    good = ~bad
-    if np.sum(good) > 10 and np.any(bad):
-        f_valid[bad] = np.interp(t_valid[bad], t_valid[good], f_valid[good])
-
-    f_clean = np.full_like(f, np.nan)
-    f_clean[valid_sf] = f_valid
-
-    kernel_len = odd_window(cfg.freq_clean_kernel, len(f_clean))
-    kernel = np.ones(kernel_len)
-    valid2 = np.isfinite(f_clean)
-    num = np.convolve(np.where(valid2, f_clean, 0.0), kernel, mode="same")
-    den = np.convolve(valid2.astype(float), kernel, mode="same")
-    freq_interp_raw = num / den
+    freq_interp_raw_falling = _interpolate_and_clean_freq(
+        t_scope_in_wm_guess + best_shift_falling,
+        t_raw, scan_raw, wm_t, wm_f,
+        cfg.freq_clean_kernel,
+    )
 
     return {
         "freq_interp_raw": freq_interp_raw,
+        "freq_interp_raw_falling": freq_interp_raw_falling,
         "t_scope_ttl": t_scope_ttl,
         "t_wm_ttl_approx": t_wm_ttl_approx,
         "best_shift": best_shift,
         "best_score": best_score,
+        "best_shift_falling": best_shift_falling,
+        "best_score_falling": best_score_falling,
     }
 
 
-def prepare_binned_scope(scope: Dict[str, Any], freq_interp_raw: np.ndarray, cfg: AnalysisConfig) -> Dict[str, np.ndarray]:
+def prepare_binned_scope(
+    scope: Dict[str, Any],
+    freq_interp_raw: np.ndarray,
+    cfg: AnalysisConfig,
+    freq_interp_raw_falling: Optional[np.ndarray] = None,
+) -> Dict[str, np.ndarray]:
     t_raw = scope["t"]
     probe_raw = scope["probe"]
     ref_raw = scope["ref"]
@@ -370,7 +460,7 @@ def prepare_binned_scope(scope: Dict[str, Any], freq_interp_raw: np.ndarray, cfg
     scan = bin_average_1d(scan_raw, cfg.bin_size)
     freq_interp = bin_average_1d(freq_interp_raw, cfg.bin_size)
 
-    return {
+    result = {
         "t": t,
         "probe": probe,
         "ref": ref,
@@ -383,6 +473,13 @@ def prepare_binned_scope(scope: Dict[str, Any], freq_interp_raw: np.ndarray, cfg
         "ttl_raw": ttl_raw,
         "scan_raw": scan_raw,
     }
+
+    if freq_interp_raw_falling is not None:
+        result["freq_interp_falling"] = bin_average_1d(freq_interp_raw_falling, cfg.bin_size)
+    else:
+        result["freq_interp_falling"] = freq_interp
+
+    return result
 
 
 def detect_rising_ramps(t: np.ndarray, scan: np.ndarray, cfg: AnalysisConfig) -> Tuple[np.ndarray, List[slice]]:
@@ -443,6 +540,71 @@ def detect_rising_ramps(t: np.ndarray, scan: np.ndarray, cfg: AnalysisConfig) ->
     return scan_smooth, ramp_slices
 
 
+def detect_falling_ramps(t: np.ndarray, scan: np.ndarray, cfg: AnalysisConfig) -> List[slice]:
+    """
+    Detect falling (negative) ramps in the scan signal.
+    Mirrors detect_rising_ramps exactly, thresholding on negative derivatives
+    instead of positive ones. Returns ramp slices only (scan_smooth is already
+    available from detect_rising_ramps).
+    """
+    smooth_window = odd_window(cfg.scan_smooth_window, len(scan))
+    scan_smooth = savgol_filter(scan, smooth_window, 3 if smooth_window >= 5 else 1)
+
+    n_coarse = len(scan_smooth) // cfg.coarse_block
+    if n_coarse < 2:
+        raise RuntimeError("Not enough data for coarse ramp detection")
+
+    scan_blocks = scan_smooth[: n_coarse * cfg.coarse_block].reshape(n_coarse, cfg.coarse_block)
+    scan_coarse = scan_blocks.mean(axis=1)
+    dscan_coarse = np.diff(scan_coarse, prepend=scan_coarse[0])
+
+    negative_d = dscan_coarse[dscan_coarse < 0]
+    if len(negative_d) == 0:
+        raise RuntimeError("No negative scan derivative points found")
+
+    # rise_threshold_fraction applied to the most-negative value (nanmin is negative)
+    fall_threshold = cfg.rise_threshold_fraction * np.nanmin(negative_d)
+    falling_state = dscan_coarse < fall_threshold
+
+    falling_ramps_coarse: List[Tuple[int, int]] = []
+    in_run = False
+    start_idx = None
+    for i, state in enumerate(falling_state):
+        if state and not in_run:
+            in_run = True
+            start_idx = i
+        elif not state and in_run:
+            falling_ramps_coarse.append((start_idx, i - 1))
+            in_run = False
+    if in_run:
+        falling_ramps_coarse.append((start_idx, len(falling_state) - 1))
+
+    ramp_slices: List[slice] = []
+    for a, b in falling_ramps_coarse:
+        start = a * cfg.coarse_block
+        end = min((b + 1) * cfg.coarse_block, len(scan_smooth))
+        start = max(0, start - cfg.start_backtrack_blocks * cfg.coarse_block)
+        end = end - cfg.end_trim_blocks * cfg.coarse_block
+        if (end - start) >= cfg.min_ramp_points:
+            ramp_slices.append(slice(start, end))
+
+    if cfg.drop_edge_ramps and len(ramp_slices) >= 3:
+        lengths = np.array([r.stop - r.start for r in ramp_slices])
+        median_len = np.median(lengths)
+        keep = []
+        for r in ramp_slices:
+            this_len = r.stop - r.start
+            k = this_len >= 0.8 * median_len
+            if r.start <= cfg.coarse_block:
+                k = False
+            if r.stop >= len(scan_smooth) - cfg.coarse_block:
+                k = False
+            keep.append(k)
+        ramp_slices = [r for r, k in zip(ramp_slices, keep) if k]
+
+    return ramp_slices
+
+
 def process_rising_ramp(
     t_r: np.ndarray,
     scan_r: np.ndarray,
@@ -490,8 +652,9 @@ def process_rising_ramp(
     if len(x_scan) < 20:
         raise RuntimeError("Ramp has too few valid points after frequency filtering")
 
-    p_lin = np.polyfit(tt, x_freq, 1)
-    x_freq_linear = p_lin[0] * tt + p_lin[1]
+    tt_mid = np.mean(tt)
+    p_lin = np.polyfit(tt - tt_mid, x_freq, 1)
+    x_freq_linear = p_lin[0] * (tt - tt_mid) + p_lin[1]
     freq_linear_resid_std_mhz = float(np.std(x_freq - x_freq_linear) * 1e6)
 
     n = len(x_scan)
@@ -507,25 +670,25 @@ def process_rising_ramp(
     od = np.log(ratio)
     diff = p - ref_scaled
 
-    t_edge = np.r_[tt[:n_edge], tt[-n_edge:]]
+    f_edge = np.r_[x_freq_linear[:n_edge], x_freq_linear[-n_edge:]]
     od_edge = np.r_[od[:n_edge], od[-n_edge:]]
     ratio_edge = np.r_[ratio[:n_edge], ratio[-n_edge:]]
     diff_edge = np.r_[diff[:n_edge], diff[-n_edge:]]
 
-    t0 = np.mean(t_edge)
-    t_edge_c = t_edge - t0
-    tt_c = tt - t0
+    f0 = np.mean(f_edge)
+    f_edge_c = f_edge - f0
+    f_c = x_freq_linear - f0
 
-    od_coeff = np.polyfit(t_edge_c, od_edge, 1)
-    od_baseline = np.polyval(od_coeff, tt_c)
+    od_coeff = np.polyfit(f_edge_c, od_edge, 1)
+    od_baseline = np.polyval(od_coeff, f_c)
     od_corr = od - od_baseline
 
-    ratio_coeff = np.polyfit(t_edge_c, ratio_edge, 1)
-    ratio_baseline = np.polyval(ratio_coeff, tt_c)
+    ratio_coeff = np.polyfit(f_edge_c, ratio_edge, 1)
+    ratio_baseline = np.polyval(ratio_coeff, f_c)
     ratio_corr = ratio / ratio_baseline
 
-    diff_coeff = np.polyfit(t_edge_c, diff_edge, 1)
-    diff_baseline = np.polyval(diff_coeff, tt_c)
+    diff_coeff = np.polyfit(f_edge_c, diff_edge, 1)
+    diff_baseline = np.polyval(diff_coeff, f_c)
     diff_corr = diff - diff_baseline
 
     return {
@@ -1012,19 +1175,22 @@ def estimate_linear_baseline_excluding_peaks(
 def global_multi_voigt_with_baseline(
     x: np.ndarray,
     c0: float,
+    c1: float,
     *params: float,
 ) -> np.ndarray:
     """
-    Global multi-peak Voigt model with a constant residual baseline,
+    Global multi-peak Voigt model with a linear residual baseline,
     intended to be used on a pre-flattened selected fit window.
 
     Parameter order:
-        c0,
+        c0,   (constant baseline offset)
+        c1,   (baseline slope, in ratio units per THz, centred on x_ref)
         A1, x01, sigma1, gamma1,
         A2, x02, sigma2, gamma2,
         ...
     """
-    y = np.full_like(x, c0, dtype=float)
+    x_ref = float(np.mean(x))
+    y = c0 + c1 * (x - x_ref)
 
     if len(params) % 4 != 0:
         raise ValueError("params must be groups of 4: A, x0, sigma, gamma")
@@ -1044,19 +1210,22 @@ def global_multi_voigt_with_fixed_widths(
     fixed_sigmas: np.ndarray,
     fixed_gammas: np.ndarray,
     c0: float,
+    c1: float,
     *params: float,
 ) -> np.ndarray:
     """
-    Global multi-peak Voigt model with constant residual baseline and
+    Global multi-peak Voigt model with linear residual baseline and
     fixed sigma/gamma for each peak.
 
     Parameter order:
-        c0,
+        c0,   (constant baseline)
+        c1,   (baseline slope, centred on x_ref)
         A1, x01,
         A2, x02,
         ...
     """
-    y = np.full_like(x, c0, dtype=float)
+    x_ref = float(np.mean(x))
+    y = c0 + c1 * (x - x_ref)
 
     if len(params) % 2 != 0:
         raise ValueError("params must be groups of 2: A, x0")
@@ -1121,9 +1290,9 @@ def fit_single_peak(avg: Dict[str, Any], strong_peaks: List[Dict[str, Any]], cfg
     ]
     upper_bounds = [
         0.05,                # A
-        x0_guess + 3e-5,     # x0
-        2e-5,                # sigma
-        2e-5,                # gamma
+        x0_guess + 5e-5,     # x0 — ±50 MHz to match global fit
+        5e-5,                # sigma — raised to match global fit upper bound
+        5e-5,                # gamma — raised to match global fit upper bound
         c0_guess + 0.01,     # c0
         100.0,               # c1
     ]
@@ -1320,8 +1489,19 @@ def build_physics_results(
         assignment = r.get("isotope_assignment")
         isotope_label = None if assignment is None else assignment.get("expected_label")
 
+        # Correct sigma for frequency jitter contribution (per-ramp jitter broadens the
+        # averaged Gaussian sigma). Subtract jitter in quadrature if available.
+        sigma_thz_raw = r["sigma_thz"]
+        jitter_sigma_thz = 0.0
+        if hasattr(cfg, "_per_ramp_jitter_sigma_thz") and cfg._per_ramp_jitter_sigma_thz is not None:
+            jitter_sigma_thz = float(cfg._per_ramp_jitter_sigma_thz)
+
+        sigma_thz_corrected = sigma_thz_raw
+        if jitter_sigma_thz > 0 and sigma_thz_raw > jitter_sigma_thz:
+            sigma_thz_corrected = float(np.sqrt(sigma_thz_raw**2 - jitter_sigma_thz**2))
+
         velocity_sigma_ms = velocity_sigma_from_sigma_thz(
-            sigma_thz=r["sigma_thz"],
+            sigma_thz=sigma_thz_corrected,
             centre_thz=r["centre_thz"],
         )
 
@@ -1358,8 +1538,11 @@ def build_physics_results(
             "assigned_isotope": isotope_label,
             "centre_thz": r["centre_thz"],
             "offset_mhz": None if assignment is None else assignment.get("offset_mhz"),
-            "sigma_thz": r["sigma_thz"],
-            "sigma_mhz": float(r["sigma_thz"]) * 1e6,
+            "sigma_thz_raw": r["sigma_thz"],
+            "sigma_thz_corrected": sigma_thz_corrected,
+            "sigma_mhz_raw": float(r["sigma_thz"]) * 1e6,
+            "sigma_mhz_corrected": float(sigma_thz_corrected) * 1e6,
+            "jitter_sigma_thz": jitter_sigma_thz,
             "velocity_sigma_ms": velocity_sigma_ms,
             "beam_speed_ms": beam_speed_ms,
             "spatial_sigma_m": spatial_sigma_m,
@@ -1384,134 +1567,6 @@ def save_physics_csv(physics_df: Optional[pd.DataFrame], cfg: AnalysisConfig, ou
     path = outdir / prefixed_name(cfg, "physics_results.csv")
     physics_df.to_csv(path, index=False)
     return path
-
-def fit_selected_peaks(avg: Dict[str, Any], strong_peaks: List[Dict[str, Any]], cfg: AnalysisConfig) -> Optional[Dict[str, Any]]:
-    if len(strong_peaks) == 0:
-        return None
-
-    peak_indices = cfg.multi_fit_peak_indices
-    if not peak_indices:
-        peak_indices = list(range(len(strong_peaks)))
-
-    selected_peaks = [strong_peaks[i] for i in peak_indices]
-    selected_peaks = sorted(selected_peaks, key=lambda p: p["x"])
-    x0_guesses = np.array([p["x"] for p in selected_peaks], dtype=float)
-    peak_labels = [p["peak_label"] for p in selected_peaks]
-
-    x = avg["common_x"]
-    y = avg["ratio_mean"]
-
-    x_min_fit = np.min(x0_guesses) - cfg.multi_fit_margin_thz
-    x_max_fit = np.max(x0_guesses) + cfg.multi_fit_margin_thz
-    mask_fit = (x >= x_min_fit) & (x <= x_max_fit)
-    x_fit = x[mask_fit]
-    y_fit = y[mask_fit]
-
-    fit_results = []
-
-    n_selected = len(x0_guesses)
-
-    for i, (lbl, x0) in enumerate(zip(peak_labels, x0_guesses)):
-        # Base local fit window
-        half_width = cfg.multi_fit_local_half_width_thz
-
-        # The leftmost peak benefits from the tighter window.
-        # The rightmost peak needs a larger window again.
-        if i == n_selected - 1:
-            half_width = max(half_width, 6e-5)
-
-        mask_local = (x_fit >= x0 - half_width) & (x_fit <= x0 + half_width)
-        x_local = x_fit[mask_local]
-        y_local = y_fit[mask_local]
-        if len(x_local) < 20:
-            continue
-
-        # Local baseline guess from the edges of THIS local window, not the global combined window
-        n_edge = max(5, len(x_local) // 5)
-        y_edge_local = np.r_[y_local[:n_edge], y_local[-n_edge:]]
-        c0_guess = float(np.mean(y_edge_local))
-
-        idx0 = np.argmin(np.abs(x_local - x0))
-        A0 = max(1e-9, y_local[idx0] - c0_guess)
-
-        c1_guess = 0.0
-
-        p0 = [A0, x0, 6e-6, 6e-6, c0_guess, c1_guess]
-        lower_bounds = [0.0, x0 - 3e-5, 1e-6, 1e-6, c0_guess - 0.01, -100.0]
-        upper_bounds = [0.05, x0 + 3e-5, 2e-5, 2e-5, c0_guess + 0.01, 100.0]
-
-        popt, pcov = curve_fit(
-            voigt_with_baseline,
-            x_local,
-            y_local,
-            p0=p0,
-            bounds=(lower_bounds, upper_bounds),
-            maxfev=50000,
-        )
-
-        A_fit, x0_fit, sigma_fit, gamma_fit, c0_fit, c1_fit = popt
-        perr = np.sqrt(np.diag(pcov))
-        A_err, x0_err, sigma_err, gamma_err, c0_err, c1_err = perr
-
-        fwhm_voigt_thz = 0.5346 * (2 * gamma_fit) + np.sqrt(
-            0.2166 * (2 * gamma_fit) ** 2 + (2.35482 * sigma_fit) ** 2
-        )
-
-        expected_positions = cfg.expected_peak_positions_thz or default_expected_peaks()
-        assignment = match_detected_to_expected_single(float(x0_fit), expected_positions)
-
-        fit_results.append({
-            "peak_label": lbl,
-            "centre_thz": float(x0_fit),
-            "centre_err_thz": float(x0_err),
-            "amplitude": float(A_fit),
-            "amplitude_err": float(A_err),
-            "sigma_thz": float(sigma_fit),
-            "sigma_err_thz": float(sigma_err),
-            "gamma_thz": float(gamma_fit),
-            "gamma_err_thz": float(gamma_err),
-            "baseline_c0": float(c0_fit),
-            "baseline_c0_err": float(c0_err),
-            "baseline_c1": float(c1_fit),
-            "baseline_c1_err": float(c1_err),
-            "fwhm_mhz": float(fwhm_voigt_thz * 1e6),
-            "fwhm_err_mhz": np.nan,
-            "fit_half_width_thz": float(half_width),
-            "isotope_assignment": assignment,
-        })
-
-    # Build combined model for residuals using a linear baseline fitted to the outer edges
-    n_edge_fit = max(10, len(x_fit) // 10)
-    x_edge_fit = np.r_[x_fit[:n_edge_fit], x_fit[-n_edge_fit:]]
-    y_edge_fit = np.r_[y_fit[:n_edge_fit], y_fit[-n_edge_fit:]]
-
-    x_ref = float(np.mean(x0_guesses))
-    edge_coeff = np.polyfit(x_edge_fit - x_ref, y_edge_fit, 1)
-    c1_model = float(edge_coeff[0])
-    c0_model = float(edge_coeff[1])
-
-    baseline_fit = c0_model + c1_model * (x_fit - x_ref)
-
-    y_model = baseline_fit.copy()
-    for r in fit_results:
-        y_model += voigt_profile(
-            x_fit - r["centre_thz"],
-            r["sigma_thz"],
-            r["gamma_thz"],
-        ) * r["amplitude"]
-
-    resid = y_fit - y_model
-    resid_rms = float(np.sqrt(np.mean(resid**2)))
-
-    return {
-        "x_fit": x_fit,
-        "y_fit": y_fit,
-        "baseline_fit": baseline_fit,
-        "y_model": y_model,
-        "resid": resid,
-        "resid_rms": resid_rms,
-        "fit_results": fit_results,
-    }
 
 def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, Any]], cfg: AnalysisConfig) -> Optional[Dict[str, Any]]:
     if len(strong_peaks) == 0:
@@ -1551,16 +1606,25 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
     # Flatten the selected window so the final global fit does not have to fight the slope
     y_fit_flat = y_fit - baseline_prefit + 1.0
 
-    # Residual baseline after pre-flattening should be close to constant
+    # Residual baseline after pre-flattening — allow a small slope to absorb
+    # any curvature the linear pre-fit didn't fully remove
     c0_guess = 1.0
+    c1_guess = 0.0
 
-    p0 = [c0_guess]
-    lower_bounds = [0.98]
-    upper_bounds = [1.02]
+    x_ref = float(np.mean(x_fit))
+
+    p0 = [c0_guess, c1_guess]
+    lower_bounds = [0.98, -50.0]
+    upper_bounds = [1.02,  50.0]
 
     for x0 in x0_guesses:
-        idx0 = int(np.argmin(np.abs(x_fit - x0)))
-        A0 = max(1e-6, float(y_fit_flat[idx0] - c0_guess))
+        # Use the local maximum near x0 as amplitude guess, not just the nearest point
+        local_mask = np.abs(x_fit - x0) < 5e-5  # within 50 MHz
+        if np.sum(local_mask) > 0:
+            A0 = max(1e-6, float(np.max(y_fit_flat[local_mask]) - c0_guess))
+        else:
+            idx0 = int(np.argmin(np.abs(x_fit - x0)))
+            A0 = max(1e-6, float(y_fit_flat[idx0] - c0_guess))
 
         sigma0 = 6e-6
         gamma0 = 6e-6
@@ -1569,14 +1633,14 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
 
         lower_bounds.extend([
             0.0,          # amplitude
-            x0 - 3e-5,    # centre
+            x0 - 5e-5,    # centre — ±50 MHz
             1e-6,         # sigma
             1e-6          # gamma
         ])
 
         upper_bounds.extend([
             0.05,
-            x0 + 3e-5,
+            x0 + 5e-5,
             5e-5,
             5e-5
         ])
@@ -1594,8 +1658,9 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
 
     # Convert the model back to the original ratio scale for plotting and residuals
     c0_fit = popt[0]
-    baseline_fit = baseline_prefit + (c0_fit - 1.0)
-    y_model = baseline_fit + (y_model_flat - c0_fit)
+    c1_fit = popt[1]
+    baseline_fit = baseline_prefit + (c0_fit - 1.0) + c1_fit * (x_fit - x_ref)
+    y_model = baseline_fit + (y_model_flat - c0_fit - c1_fit * (x_fit - x_ref))
 
     resid = y_fit - y_model
     resid_rms = float(np.sqrt(np.mean(resid**2)))
@@ -1603,13 +1668,15 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
     perr = np.sqrt(np.diag(pcov))
 
     c0_fit = popt[0]
+    c1_fit = popt[1]
     c0_err = perr[0]
+    c1_err = perr[1]
 
     expected_positions = cfg.expected_peak_positions_thz or default_expected_peaks()
 
     fit_results = []
     for i, lbl in enumerate(peak_labels):
-        base = 1 + 4 * i
+        base = 2 + 4 * i  # now offset by 2 (c0 and c1) instead of 1
 
         A_fit = popt[base]
         x0_fit = popt[base + 1]
@@ -1638,8 +1705,8 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
             "gamma_err_thz": float(gamma_err),
             "baseline_c0": float(c0_fit),
             "baseline_c0_err": float(c0_err),
-            "baseline_c1": 0.0,
-            "baseline_c1_err": 0.0,
+            "baseline_c1": float(c1_fit),
+            "baseline_c1_err": float(c1_err),
             "fwhm_mhz": float(fwhm_voigt_thz * 1e6),
             "fwhm_err_mhz": np.nan,
             "isotope_assignment": assignment,
@@ -1702,17 +1769,20 @@ def fit_selected_peaks_global_with_fixed_labels(
     y_fit_flat = y_fit - baseline_prefit + 1.0
 
     c0_guess = 1.0
-    p0 = [c0_guess]
-    lower_bounds = [0.98]
-    upper_bounds = [1.02]
+    c1_guess = 0.0
+    x_ref = float(np.mean(x_fit))
+
+    p0 = [c0_guess, c1_guess]
+    lower_bounds = [0.98, -50.0]
+    upper_bounds = [1.02,  50.0]
 
     for x0 in x0_guesses:
         idx0 = int(np.argmin(np.abs(x_fit - x0)))
         A0 = max(1e-6, float(y_fit_flat[idx0] - c0_guess))
 
         p0.extend([A0, x0])
-        lower_bounds.extend([0.0, x0 - 3e-5])
-        upper_bounds.extend([0.05, x0 + 3e-5])
+        lower_bounds.extend([0.0, x0 - 5e-5])
+        upper_bounds.extend([0.05, x0 + 5e-5])
 
     try:
         popt, pcov = curve_fit(
@@ -1731,20 +1801,22 @@ def fit_selected_peaks_global_with_fixed_labels(
     y_model_flat = global_multi_voigt_with_fixed_widths(x_fit, fixed_sigmas, fixed_gammas, *popt)
 
     c0_fit = popt[0]
-    baseline_fit = baseline_prefit + (c0_fit - 1.0)
-    y_model = baseline_fit + (y_model_flat - c0_fit)
+    c1_fit = popt[1]
+    baseline_fit = baseline_prefit + (c0_fit - 1.0) + c1_fit * (x_fit - x_ref)
+    y_model = baseline_fit + (y_model_flat - c0_fit - c1_fit * (x_fit - x_ref))
 
     resid = y_fit - y_model
     resid_rms = float(np.sqrt(np.mean(resid**2)))
 
     perr = np.sqrt(np.diag(pcov))
     c0_err = perr[0]
+    c1_err = perr[1]
 
     expected_positions = cfg.expected_peak_positions_thz or default_expected_peaks()
 
     fit_results = []
     for i, lbl in enumerate(peak_labels):
-        base = 1 + 2 * i
+        base = 2 + 2 * i  # now offset by 2 (c0 and c1)
 
         A_fit = popt[base]
         x0_fit = popt[base + 1]
@@ -2526,7 +2598,213 @@ def save_summary_text(
     return path
 
 
+def make_ramp_comparison_plot(
+    avg_rising: Dict[str, Any],
+    avg_falling: Dict[str, Any],
+    multi_fit_rising: Optional[Dict[str, Any]],
+    multi_fit_falling: Optional[Dict[str, Any]],
+    cfg: AnalysisConfig,
+    outdir: Path,
+    output_filename: str = "ramp_comparison.png",
+) -> Path:
+    """
+    Overlay the averaged OD spectra from rising and falling ramps, with fitted
+    peak centres marked. Used to validate that both ramp directions agree before
+    folding them together.
+    """
+    x_rising = thz_to_mhz(avg_rising["common_x"], cfg.f_ref_thz)
+    x_falling = thz_to_mhz(avg_falling["common_x"], cfg.f_ref_thz)
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False,
+                             gridspec_kw={"hspace": 0.4})
+
+    # --- Top panel: OD overlay ---
+    ax = axes[0]
+    ax.plot(x_rising, avg_rising["od_mean_s"], color="royalblue", lw=1.5,
+            label=f"Rising ramps (n={len(avg_rising.get('od_corr_matrix', [[]]))})")
+    ax.plot(x_falling, avg_falling["od_mean_s"], color="tomato", lw=1.5,
+            ls="--", label=f"Falling ramps (n={len(avg_falling.get('od_corr_matrix', [[]]))})")
+
+    # Mark rising fit centres
+    if multi_fit_rising and multi_fit_rising.get("fit_results"):
+        for r in multi_fit_rising["fit_results"]:
+            xc = thz_to_mhz(r["centre_thz"], cfg.f_ref_thz)
+            ax.axvline(xc, color="royalblue", ls=":", lw=1.0, alpha=0.8)
+
+    # Mark falling fit centres
+    if multi_fit_falling and multi_fit_falling.get("fit_results"):
+        for r in multi_fit_falling["fit_results"]:
+            xc = thz_to_mhz(r["centre_thz"], cfg.f_ref_thz)
+            ax.axvline(xc, color="tomato", ls=":", lw=1.0, alpha=0.8)
+
+    ax.axhline(0.0, color="black", lw=0.6)
+    ax.set_xlabel("Frequency (MHz)")
+    ax.set_ylabel("OD (baseline corrected)")
+    ax.set_title("Rising vs falling ramp comparison — OD spectra")
+    ax.legend(loc="best", fontsize=9)
+
+    # --- Bottom panel: peak centre comparison table ---
+    ax2 = axes[1]
+    ax2.axis("off")
+
+    rows = []
+    headers = ["Isotope", "Rising centre (MHz)", "Falling centre (MHz)", "Difference (MHz)"]
+
+    if (multi_fit_rising and multi_fit_rising.get("fit_results") and
+            multi_fit_falling and multi_fit_falling.get("fit_results")):
+
+        rising_centres = {
+            r["isotope_assignment"]["expected_label"]: thz_to_mhz(r["centre_thz"], cfg.f_ref_thz)
+            for r in multi_fit_rising["fit_results"]
+            if r.get("isotope_assignment") and r["isotope_assignment"].get("expected_label")
+        }
+        falling_centres = {
+            r["isotope_assignment"]["expected_label"]: thz_to_mhz(r["centre_thz"], cfg.f_ref_thz)
+            for r in multi_fit_falling["fit_results"]
+            if r.get("isotope_assignment") and r["isotope_assignment"].get("expected_label")
+        }
+
+        all_isotopes = sorted(set(rising_centres) | set(falling_centres))
+        for iso in all_isotopes:
+            rc = rising_centres.get(iso, float("nan"))
+            fc = falling_centres.get(iso, float("nan"))
+            diff = fc - rc if (np.isfinite(rc) and np.isfinite(fc)) else float("nan")
+            rows.append([
+                iso,
+                f"{rc:.2f}" if np.isfinite(rc) else "—",
+                f"{fc:.2f}" if np.isfinite(fc) else "—",
+                f"{diff:+.2f}" if np.isfinite(diff) else "—",
+            ])
+
+        # Also add OD comparison
+        rising_ods = {
+            r["isotope_assignment"]["expected_label"]: r.get("amplitude", float("nan"))
+            for r in multi_fit_rising["fit_results"]
+            if r.get("isotope_assignment") and r["isotope_assignment"].get("expected_label")
+        }
+        falling_ods = {
+            r["isotope_assignment"]["expected_label"]: r.get("amplitude", float("nan"))
+            for r in multi_fit_falling["fit_results"]
+            if r.get("isotope_assignment") and r["isotope_assignment"].get("expected_label")
+        }
+
+    if rows:
+        tbl = ax2.table(
+            cellText=rows,
+            colLabels=headers,
+            loc="center",
+            cellLoc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.scale(1, 1.4)
+        ax2.set_title("Fitted peak centre comparison", pad=8, fontsize=10)
+    else:
+        ax2.text(0.5, 0.5, "Fit results not available for one or both ramp directions",
+                 ha="center", va="center", fontsize=9, transform=ax2.transAxes)
+
+    path = outdir / prefixed_name(cfg, output_filename)
+    _save_fig(path, cfg.show_plots)
+    return path
+
+
+def correct_falling_ramp_freq_axes(
+    falling_processed: List[Dict[str, Any]],
+    selected_peaks_for_ramps: List[Dict[str, Any]],
+    cfg: AnalysisConfig,
+    common_x: np.ndarray,
+    target_centre_thz: Optional[float] = None,
+) -> Tuple[List[Dict[str, Any]], List[float]]:
+    """
+    Correct the frequency axis of each falling ramp by fitting the peak centres
+    using fixed widths from the rising ramp averaged fit, then shifting each
+    falling ramp's frequency axis so its anchor peak lands at target_centre_thz.
+
+    selected_peaks_for_ramps: peak positions and widths used as fit guesses.
+        Positions should match where peaks actually are in falling ramp data.
+        Widths should come from the rising ramp averaged fit.
+
+    target_centre_thz: the frequency (THz) the anchor peak should land at after
+        correction. If None, uses selected_peaks_for_ramps[0]["x"] as target
+        (i.e. corrects to the falling average position, not the rising position).
+        Pass the rising ramp anchor centre here to align falling to rising.
+
+    Returns:
+        corrected_falling: list of ramp dicts with shifted freq arrays
+        offsets_mhz: per-ramp frequency offset applied (MHz), nan if ramp failed
+    """
+    corrected_falling = []
+    offsets_mhz = []
+
+    if len(selected_peaks_for_ramps) == 0:
+        return falling_processed, [0.0] * len(falling_processed)
+
+    anchor_peak_label = selected_peaks_for_ramps[0]["peak_label"]
+
+    # target_centre_thz is where we WANT the anchor peak to land (rising average)
+    # anchor position in selected_peaks_for_ramps[0]["x"] is where it IS in falling data
+    if target_centre_thz is None:
+        target_centre_thz = selected_peaks_for_ramps[0]["x"]
+
+    # Build a common_x that covers the falling ramp frequency range
+    # so per-ramp fits are not extrapolating outside the data
+    x_min_fall = max(np.nanmin(r["freq"]) for r in falling_processed)
+    x_max_fall = min(np.nanmax(r["freq"]) for r in falling_processed)
+    common_x_falling = np.linspace(x_min_fall, x_max_fall, 1200)
+
+    for ramp in falling_processed:
+        avg_like = single_ramp_to_avg_like(ramp, cfg, common_x_falling)
+        fit = fit_selected_peaks_global_with_fixed_labels(avg_like, selected_peaks_for_ramps, cfg)
+
+        if fit is None or len(fit["fit_results"]) == 0:
+            offsets_mhz.append(float("nan"))
+            corrected_falling.append(None)
+            continue
+
+        # Find the anchor peak fit result
+        anchor_result = None
+        for r in fit["fit_results"]:
+            if r["peak_label"] == anchor_peak_label:
+                anchor_result = r
+                break
+
+        if anchor_result is None:
+            offsets_mhz.append(float("nan"))
+            corrected_falling.append(None)
+            continue
+
+        # Offset = where the anchor peak IS in this ramp - where we WANT it to be
+        offset_thz = anchor_result["centre_thz"] - target_centre_thz
+        offset_mhz = float(offset_thz * 1e6)
+        offsets_mhz.append(offset_mhz)
+
+        # Shift the frequency axis to bring anchor peak onto target_centre_thz
+        corrected_ramp = dict(ramp)
+        corrected_ramp["freq"] = ramp["freq"] - offset_thz
+        corrected_falling.append(corrected_ramp)
+
+    # Filter out None entries (failed ramps)
+    n_total = len(corrected_falling)
+    corrected_falling = [r for r in corrected_falling if r is not None]
+    n_ok = len(corrected_falling)
+
+    if cfg.debug:
+        print(f"[falling correction] {n_ok}/{n_total} falling ramps successfully corrected")
+        valid_offsets = [o for o in offsets_mhz if np.isfinite(o)]
+        if valid_offsets:
+            print(f"[falling correction] offset mean = {np.mean(valid_offsets):.1f} MHz, "
+                  f"std = {np.std(valid_offsets):.1f} MHz, "
+                  f"range = [{np.min(valid_offsets):.1f}, {np.max(valid_offsets):.1f}] MHz")
+
+    return corrected_falling, offsets_mhz
+
+
 def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
+    import time as _time
+    _t0 = _time.perf_counter()
+    def _lap(label: str) -> None:
+        print(f"[timing] {label}: {_time.perf_counter() - _t0:.3f}s")
+
     outdir = Path(cfg.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -2535,10 +2813,42 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
 
     scope = load_scope_npz(cfg.scope_file)
     wm_ok = load_wavemeter_csv(cfg.wavemeter_file)
+    _lap("load data")
+
+    if cfg.debug:
+        wm_t_arr = wm_ok["t_rel_perf"].to_numpy()
+        polling_intervals = np.diff(wm_t_arr)
+        print(f"[wavemeter] n_samples = {len(wm_t_arr)}")
+        print(f"[wavemeter] mean polling interval = {np.mean(polling_intervals)*1000:.2f} ms")
+        print(f"[wavemeter] median polling interval = {np.median(polling_intervals)*1000:.2f} ms")
+        print(f"[wavemeter] max polling interval = {np.max(polling_intervals)*1000:.2f} ms")
+        print(f"[wavemeter] total duration = {wm_t_arr[-1]:.3f} s")
 
     align = align_and_interpolate_frequency(scope, wm_ok, cfg)
-    prepared = prepare_binned_scope(scope, align["freq_interp_raw"], cfg)
+    prepared = prepare_binned_scope(
+        scope,
+        align["freq_interp_raw"],
+        cfg,
+        freq_interp_raw_falling=align["freq_interp_raw_falling"] if cfg.use_falling_ramps else None,
+    )
+    _lap(f"align + prepare  [best_shift={align['best_shift']:.4f}s, score={align['best_score']:.4f}]")
+
+    if cfg.debug:
+        print(f"[scope] binned samples = {len(prepared['t'])}")
+        print(f"[scope] binned sample rate = {1.0/(prepared['t'][1]-prepared['t'][0]):.1f} Hz")
+        print(f"[scope] freq_clean_kernel = {cfg.freq_clean_kernel} samples = {cfg.freq_clean_kernel*(prepared['t'][1]-prepared['t'][0])*1000:.2f} ms")
+
     scan_smooth, ramp_slices = detect_rising_ramps(prepared["t"], prepared["scan"], cfg)
+
+    if cfg.debug:
+        print(f"[alignment] best_shift = {align['best_shift']:.6f} s  (rising)")
+        if cfg.use_falling_ramps:
+            print(f"[alignment] best_shift_falling = {align['best_shift_falling']:.6f} s  (falling)")
+        print(f"[alignment] best_score = {align['best_score']:.6f}")
+        print(f"[ramps] {len(ramp_slices)} rising ramps detected")
+        if len(ramp_slices) > 0:
+            durations = [(r.stop - r.start) * (prepared['t'][1] - prepared['t'][0]) for r in ramp_slices]
+            print(f"[ramps] mean ramp duration = {np.mean(durations):.4f} s")
 
     processed = []
     for r in ramp_slices:
@@ -2552,8 +2862,10 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
             eps=cfg.eps,
             max_shift=cfg.max_shift,
         ))
+    _lap(f"process {len(processed)} rising ramps")
 
     avg = average_ramps_to_common_axis(processed, cfg)
+    _lap("average ramps")
 
     # First-pass detection on the raw averaged traces
     candidates, strong_peaks, peak_diag = detect_strong_peaks(avg, cfg)
@@ -2562,6 +2874,7 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
     # Use first-pass peak positions to remove any slow curved baseline from the averaged traces
     peak_positions_thz = [p["x"] for p in strong_peaks]
     avg = correct_average_baseline(avg, peak_positions_thz, cfg)
+    _lap("baseline correction")
 
     # Re-run detection and assignment on the baseline-corrected averaged traces
     candidates, strong_peaks, peak_diag = detect_strong_peaks(avg, cfg)
@@ -2627,6 +2940,7 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
         fit_cfg.multi_fit_peak_indices = deduped_indices
 
     multi_fit = fit_selected_peaks_global(avg, fit_input_peaks, fit_cfg)
+    _lap("global Voigt fit")
 
     per_ramp_analysis = None
     if cfg.save_per_ramp_fits and multi_fit is not None and multi_fit.get("fit_results"):
@@ -2646,6 +2960,156 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
             cfg=fit_cfg,
             common_x=avg["common_x"],
         )
+    _lap("per-ramp fits")
+
+    # ----------------------------------------------------------------
+    # Falling ramp processing (validation mode, use_falling_ramps=True)
+    # ----------------------------------------------------------------
+    falling_processed = []
+    avg_falling = None
+    multi_fit_falling = None
+    ramp_comparison_plot = None
+    avg_combined = None
+    multi_fit_combined = None
+    falling_offsets_mhz = []
+
+    if cfg.use_falling_ramps:
+        try:
+            falling_slices = detect_falling_ramps(prepared["t"], prepared["scan"], cfg)
+        except RuntimeError as exc:
+            if cfg.debug:
+                print(f"[falling ramps] detection failed: {exc}")
+            falling_slices = []
+
+        if cfg.debug:
+            print(f"[falling ramps] {len(falling_slices)} falling ramps detected")
+
+        for r in falling_slices:
+            try:
+                falling_processed.append(process_rising_ramp(
+                    prepared["t"][r],
+                    prepared["scan"][r],
+                    prepared["freq_interp_falling"][r],
+                    prepared["probe"][r],
+                    prepared["ref"][r],
+                    edge_fraction=cfg.edge_fraction,
+                    eps=cfg.eps,
+                    max_shift=cfg.max_shift,
+                ))
+            except RuntimeError:
+                continue
+
+        if len(falling_processed) >= 2:
+
+            # --- Raw falling average (for comparison plot) ---
+            avg_falling = average_ramps_to_common_axis(falling_processed, cfg)
+            avg_falling = correct_average_baseline(avg_falling, peak_positions_thz, cfg)
+
+            _, strong_peaks_falling, _ = detect_strong_peaks(avg_falling, cfg)
+            fit_input_falling = sorted(strong_peaks_falling, key=lambda p: p["x"])
+
+            fall_fit_cfg = AnalysisConfig(**asdict(fit_cfg))
+            if fall_fit_cfg.multi_fit_peak_indices is None:
+                fall_fit_cfg.multi_fit_peak_indices = list(range(len(fit_input_falling)))
+            else:
+                valid_indices = [i for i in fall_fit_cfg.multi_fit_peak_indices
+                                 if i < len(fit_input_falling)]
+                fall_fit_cfg.multi_fit_peak_indices = valid_indices
+
+            try:
+                multi_fit_falling = fit_selected_peaks_global(avg_falling, fit_input_falling, fall_fit_cfg)
+            except Exception as exc:
+                print(f"[falling ramps] global fit failed: {exc}")
+                multi_fit_falling = None
+
+            # --- Frequency-corrected falling ramps + combined average ---
+            if per_ramp_analysis is not None and multi_fit is not None and multi_fit.get("fit_results"):
+
+                # Anchor peak: use the first (strongest) peak from rising fit
+                rising_anchor = selected_peaks_for_ramps[0]
+                rising_anchor_label = rising_anchor["peak_label"]
+                rising_anchor_centre_thz = rising_anchor["x"]  # target position (rising)
+
+                # Build per-ramp fit peaks for falling ramps:
+                # - positions from multi_fit_falling (correct location in falling data)
+                # - widths from rising average fit (better constrained)
+                if multi_fit_falling is not None and multi_fit_falling.get("fit_results"):
+                    rising_widths = {
+                        r["isotope_assignment"]["expected_label"]: {
+                            "sigma_thz": r["sigma_thz"],
+                            "gamma_thz": r["gamma_thz"],
+                            "peak_label": r["peak_label"],
+                        }
+                        for r in multi_fit["fit_results"]
+                        if r.get("isotope_assignment") and r["isotope_assignment"].get("expected_label")
+                    }
+                    selected_peaks_for_falling = []
+                    for r in multi_fit_falling["fit_results"]:
+                        iso = r.get("isotope_assignment", {}).get("expected_label")
+                        widths = rising_widths.get(iso)
+                        if widths is not None:
+                            selected_peaks_for_falling.append({
+                                "peak_label": widths["peak_label"],
+                                "x": r["centre_thz"],          # falling position for fit guess
+                                "sigma_thz": widths["sigma_thz"],
+                                "gamma_thz": widths["gamma_thz"],
+                            })
+                    # Sort by peak_label to match selected_peaks_for_ramps order
+                    selected_peaks_for_falling = sorted(
+                        selected_peaks_for_falling, key=lambda p: p["peak_label"]
+                    )
+                    if len(selected_peaks_for_falling) == 0:
+                        selected_peaks_for_falling = selected_peaks_for_ramps
+                else:
+                    selected_peaks_for_falling = selected_peaks_for_ramps
+
+                corrected_falling, falling_offsets_mhz = correct_falling_ramp_freq_axes(
+                    falling_processed=falling_processed,
+                    selected_peaks_for_ramps=selected_peaks_for_falling,
+                    cfg=fit_cfg,
+                    common_x=avg["common_x"],
+                    target_centre_thz=rising_anchor_centre_thz,
+                )
+
+                if len(corrected_falling) >= 2:
+                    # Pool rising + corrected falling ramps
+                    combined_processed = processed + corrected_falling
+                    avg_combined = average_ramps_to_common_axis(combined_processed, cfg)
+                    avg_combined = correct_average_baseline(avg_combined, peak_positions_thz, cfg)
+
+                    _, strong_peaks_combined, _ = detect_strong_peaks(avg_combined, cfg)
+                    fit_input_combined = sorted(strong_peaks_combined, key=lambda p: p["x"])
+
+                    combined_fit_cfg = AnalysisConfig(**asdict(fit_cfg))
+                    if combined_fit_cfg.multi_fit_peak_indices is None:
+                        combined_fit_cfg.multi_fit_peak_indices = list(range(len(fit_input_combined)))
+                    else:
+                        valid_indices = [i for i in combined_fit_cfg.multi_fit_peak_indices
+                                         if i < len(fit_input_combined)]
+                        combined_fit_cfg.multi_fit_peak_indices = valid_indices
+
+                    try:
+                        multi_fit_combined = fit_selected_peaks_global(avg_combined, fit_input_combined, combined_fit_cfg)
+                        if cfg.debug:
+                            print(f"[combined] {len(combined_processed)} total ramps "
+                                  f"({len(processed)} rising + {len(corrected_falling)} corrected falling)")
+                            if multi_fit_combined and multi_fit_combined.get("fit_results"):
+                                for r in multi_fit_combined["fit_results"]:
+                                    a = r["isotope_assignment"]
+                                    print(f"[combined] {r['peak_label']} -> {a['expected_label']} | "
+                                          f"centre = {r['centre_thz']:.9f} THz | "
+                                          f"FWHM = {r['fwhm_mhz']:.3f} MHz")
+                    except Exception as exc:
+                        if cfg.debug:
+                            print(f"[combined] global fit failed: {exc}")
+                        multi_fit_combined = None
+                else:
+                    if cfg.debug:
+                        print(f"[combined] not enough corrected falling ramps ({len(corrected_falling)}), skipping combined average")
+
+        else:
+            if cfg.debug:
+                print(f"[falling ramps] only {len(falling_processed)} valid ramps found, skipping averaging")
 
     plot_paths = []
     if cfg.save_plots:
@@ -2673,8 +3137,45 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
         )
         plot_paths.append(isotope_plot)
 
+        if cfg.use_falling_ramps and avg_falling is not None:
+            ramp_comparison_plot = make_ramp_comparison_plot(
+                avg_rising=avg,
+                avg_falling=avg_falling,
+                multi_fit_rising=multi_fit,
+                multi_fit_falling=multi_fit_falling,
+                cfg=cfg,
+                outdir=outdir,
+                output_filename="ramp_comparison.png",
+            )
+            plot_paths.append(ramp_comparison_plot)
+
+        if cfg.use_falling_ramps and avg_combined is not None:
+            combined_comparison_plot = make_ramp_comparison_plot(
+                avg_rising=avg,
+                avg_falling=avg_combined,
+                multi_fit_rising=multi_fit,
+                multi_fit_falling=multi_fit_combined,
+                cfg=cfg,
+                outdir=outdir,
+                output_filename="combined_comparison.png",
+            )
+            plot_paths.append(combined_comparison_plot)
+    _lap("plots")
+
     strong_csv, fit_csv = save_csvs(strong_peaks, multi_fit, isotope_assignment, cfg, outdir)
     per_ramp_csv, per_ramp_summary_csv = save_per_ramp_csvs(per_ramp_analysis, cfg, outdir)
+
+    # Pass per-ramp jitter into cfg so build_physics_results can correct sigma
+    if per_ramp_analysis is not None:
+        summary_df = per_ramp_analysis.get("per_ramp_summary_df")
+        if summary_df is not None and not summary_df.empty and "centre_std_mhz" in summary_df.columns:
+            # Mean jitter std across all fitted peaks, converted to THz
+            mean_jitter_mhz = float(summary_df["centre_std_mhz"].dropna().mean())
+            cfg._per_ramp_jitter_sigma_thz = mean_jitter_mhz * 1e-6
+        else:
+            cfg._per_ramp_jitter_sigma_thz = None
+    else:
+        cfg._per_ramp_jitter_sigma_thz = None
 
     physics_df = build_physics_results(avg, multi_fit, cfg)
     physics_csv = save_physics_csv(physics_df, cfg, outdir)
@@ -2691,6 +3192,8 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
         cfg,
         outdir,
     )
+    _lap("save outputs")
+    _lap("TOTAL")
 
     return {
         "processed": processed,
@@ -2703,6 +3206,13 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
         "single_fit": single_fit,
         "multi_fit": multi_fit,
         "per_ramp_analysis": per_ramp_analysis,
+        "falling_processed": falling_processed,
+        "avg_falling": avg_falling,
+        "multi_fit_falling": multi_fit_falling,
+        "falling_offsets_mhz": falling_offsets_mhz,
+        "avg_combined": avg_combined,
+        "multi_fit_combined": multi_fit_combined,
+        "ramp_comparison_plot": ramp_comparison_plot,
         "plot_paths": plot_paths,
         "summary_txt": summary_txt,
         "strong_csv": strong_csv,
