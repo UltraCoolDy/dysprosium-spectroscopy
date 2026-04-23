@@ -5,7 +5,7 @@ __pycache__/
 # Data
 *.npz
 *.csv
-combined_acq_full/
+data_acq/
 *.png
 
 # OS / editor

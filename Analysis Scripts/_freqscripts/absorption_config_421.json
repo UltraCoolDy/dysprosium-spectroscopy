@@ -1,0 +1,18 @@
+{
+  "f_ref_thz": 711.605110,
+  "expected_peak_positions_thz": {
+    "Dy164": 711.605110,
+    "Dy163": 711.605380,
+    "Dy162": 711.606060,
+    "Dy161": 711.607360
+  },
+  "single_fit_peak_index": 0,
+  "multi_fit_peak_indices": [0, 1, 2],
+  "multi_fit_local_half_width_thz": 6e-5,
+  "global_baseline_exclude_half_width_thz": 1.2e-4,
+  "save_per_ramp_fits": true,
+  "per_ramp_min_successful_peaks": 2,
+  "save_plots": true,
+  "show_plots": false,
+  "debug": false
+}
