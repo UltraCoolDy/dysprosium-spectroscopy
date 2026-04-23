@@ -296,6 +296,7 @@ def menu_select(datasets: List[Dict]) -> List[Dict]:
     print("  n   = run all new datasets")
     print("  a   = run all datasets")
     print("  l   = run latest new dataset")
+    print("  t   = run all new datasets from today")
     print("  3   = run dataset 3")
     print("  2,5 = run datasets 2 and 5")
 
@@ -307,6 +308,10 @@ def menu_select(datasets: List[Dict]) -> List[Dict]:
     if choice == "l":
         new_ds = [d for d in datasets if not d["analyzed"]]
         return new_ds[-1:] if new_ds else []
+    if choice == "t":
+        from datetime import date
+        today = date.today().strftime("%Y%m%d")
+        return [d for d in datasets if d["stem"].startswith(today)]
 
     idxs: List[int] = []
     for chunk in choice.split(","):
@@ -341,12 +346,22 @@ def main() -> None:
         print("No datasets selected.")
         return
 
+    # If more than one dataset selected and any are already analysed, ask once
+    already_done = [d for d in selected if d["analyzed"]]
+    if already_done:
+        if len(selected) > 1:
+            reply = input(f"{len(already_done)} of {len(selected)} datasets already analysed. Overwrite all? [y/N]: ").strip().lower()
+            overwrite_all = reply == "y"
+        else:
+            reply = input(f"{selected[0]['stem']} is already analysed. Re-run and overwrite? [y/N]: ").strip().lower()
+            overwrite_all = reply == "y"
+    else:
+        overwrite_all = True
+
     for dataset in selected:
-        if dataset["analyzed"]:
-            reply = input(f"{dataset['stem']} is already analysed. Re-run and overwrite outputs? [y/N]: ").strip().lower()
-            if reply != "y":
-                print(f"Skipping {dataset['stem']}")
-                continue
+        if dataset["analyzed"] and not overwrite_all:
+            print(f"Skipping {dataset['stem']}")
+            continue
 
         cfg = build_cfg(dataset)
         

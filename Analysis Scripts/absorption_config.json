@@ -7,7 +7,7 @@
     "Dy161": 355.803680
   },
   "avg_baseline_poly_order": 2,
-  "avg_baseline_exclude_half_width_thz": 1.5e-4,
+  "avg_baseline_exclude_half_width_thz": 2.5e-4,
   "single_fit_peak_index": 0,
   "multi_fit_peak_indices": [0, 1, 2],
   "multi_fit_local_half_width_thz": 6e-5,
