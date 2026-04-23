@@ -29,14 +29,14 @@ WAVEMETER_SWITCH_PORT = 4 #Wavemeter port labels - 421 = 1, 626 = 3, 842 = 4
 WAVEMETER_CMD = "WAVElength\n"
 WAVEMETER_TIMEOUT_S = 0.15
 
-OUTPUT_DIR = Path("data_acq")
+OUTPUT_DIR = Path(r"C:\Users\dysprosium\labscript-suite\userlib\labscriptlib\quantum_gas_microscope\Dysprosium\Spectroscopy\data_acq")
 
 SCOPE_TIMEOUT_MS = 20000
 POST_SHOT_EXTRA_WAIT_S = 0.5
 
 # OCR temperature grab settings
-EC_IMG = (400, 250, 560, 300)
-HL_IMG = (1350, 250, 1540, 300)
+EC_IMG = (405, 250, 560, 300)
+HL_IMG = (1365, 250, 1520, 300)
 
 # Scope trigger settings
 TRIG_SOURCE = "CH4"
@@ -311,15 +311,30 @@ def quick_quality_check(scope_npz: Path, wavemeter_csv: Path, dataset_stem: str)
                 avg = correct_average_baseline(avg, [p["x"] for p in strong_peaks], cfg)
                 _, strong_peaks, _ = detect_strong_peaks(avg, cfg)
                 if strong_peaks:
-                    peak_od = float(strong_peaks[0].get("peak_od", float("nan")))
-                    target  = strong_peaks[0]["x"]
+                    # Peak OD: read directly from averaged OD trace at peak position
+                    target = strong_peaks[0]["x"]
+                    x_avg  = avg["common_x"]
+                    od_avg = avg["od_mean_s"]
+                    window_avg = np.abs(x_avg - target) < 5e-5
+                    if np.sum(window_avg) > 0:
+                        peak_od = float(np.max(od_avg[window_avg]))
+
+                    # Jitter: fit a parabola to peak region in each ramp
+                    # much more robust than argmax on noisy data
                     centres = []
                     for ramp in processed:
-                        window = np.abs(ramp["freq"] - target) < 5e-5
+                        window = np.abs(ramp["freq"] - target) < 4e-5
                         if np.sum(window) > 5:
-                            centres.append(float(
-                                ramp["freq"][window][np.argmax(ramp["od_corr"][window])]
-                            ))
+                            f_w = ramp["freq"][window]
+                            od_w = ramp["od_corr"][window]
+                            try:
+                                coeffs = np.polyfit(f_w - target, od_w, 2)
+                                if coeffs[0] < 0:  # concave down = real peak
+                                    centre = -coeffs[1] / (2 * coeffs[0])
+                                    if abs(centre) < 4e-5:  # sanity check
+                                        centres.append(float(target + centre))
+                            except Exception:
+                                pass
                     if len(centres) >= 3:
                         jitter_mhz = float(np.std(centres) * 1e6)
             except Exception:
