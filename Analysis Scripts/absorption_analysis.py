@@ -842,8 +842,14 @@ def correct_average_baseline(
         return y_corr, baseline
 
     ratio_mean_corr, ratio_baseline = _correct_one(avg["ratio_mean"])
-    od_mean_corr, od_baseline = _correct_one(avg["od_mean"])
-    diff_mean_corr, diff_baseline = _correct_one(avg["diff_mean"])
+    od_mean_corr, od_baseline       = _correct_one(avg["od_mean"])
+    diff_mean_corr, diff_baseline   = _correct_one(avg["diff_mean"])
+
+    # Re-zero the OD trace so off-resonance baseline sits at zero.
+    # This corrects for probe/ref imbalance without affecting the ratio trace
+    # (which peak detection and fitting use independently).
+    od_off_resonance_level = float(np.nanmedian(od_mean_corr[baseline_mask]))
+    od_mean_corr = od_mean_corr - od_off_resonance_level
 
     win = odd_window(cfg.display_savgol_window, len(x))
     poly = min(cfg.display_savgol_poly, win - 1)
@@ -936,8 +942,10 @@ def detect_strong_peaks(avg: Dict[str, Any], cfg: AnalysisConfig) -> Tuple[List[
     ratio_detect = savgol_filter(ratio_search, cfg.peak_detect_window, cfg.peak_detect_poly)
     od_detect = savgol_filter(od_search, cfg.peak_detect_window, cfg.peak_detect_poly)
 
-    baseline = np.percentile(od_detect, 40)
-    noise = np.std(od_detect - baseline)
+    # Use median absolute deviation for robust baseline and noise estimation
+    # Works correctly whether baseline is at zero or offset
+    baseline = np.nanmedian(od_detect)
+    noise = np.nanmedian(np.abs(od_detect - baseline)) * 1.4826  # MAD to sigma
     threshold = baseline + cfg.peak_threshold_sigma * noise
 
     above = od_detect > threshold
