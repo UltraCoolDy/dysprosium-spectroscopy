@@ -1108,73 +1108,6 @@ def find_local_peak_near_prediction(
 
     return peak
 
-def find_shoulder_peak_near_prediction(
-    x_mhz: np.ndarray,
-    y: np.ndarray,
-    pred_mhz: float,
-    anchor_mhz: float,
-    window_mhz: float = 40.0,
-    min_snr: float = 1.5,
-):
-    """
-    Search for a weak peak that sits on the shoulder of a stronger neighbour (e.g. Dy163
-    on the shoulder of Dy164). Unlike find_local_peak_near_prediction, this function:
-      - Restricts the search window to the side of pred_mhz AWAY from the anchor peak
-        to avoid the anchor's tail dominating the local maximum detection
-      - Estimates baseline from the far edge of the window only (not both edges)
-      - Uses a lower default min_snr since we expect a weak shoulder peak
-    anchor_mhz: position of the neighbouring strong peak to avoid (e.g. Dy164)
-    """
-    # Only search on the far side from the anchor
-    if pred_mhz > anchor_mhz:
-        mask = (x_mhz > anchor_mhz + 0.4 * (pred_mhz - anchor_mhz)) &                (x_mhz < pred_mhz + window_mhz)
-    else:
-        mask = (x_mhz > pred_mhz - window_mhz) &                (x_mhz < anchor_mhz - 0.4 * (anchor_mhz - pred_mhz))
-
-    if np.sum(mask) < 8:
-        return None
-
-    x_local = x_mhz[mask]
-    y_local = y[mask]
-
-    idx = int(np.argmax(y_local))
-
-    # Reject if maximum is at the very edge closest to the anchor
-    if pred_mhz > anchor_mhz and idx == 0:
-        return None
-    if pred_mhz < anchor_mhz and idx == len(y_local) - 1:
-        return None
-
-    # Baseline from the far edge only (away from anchor)
-    n_edge = max(3, int(0.2 * len(y_local)))
-    if pred_mhz > anchor_mhz:
-        y_edge = y_local[-n_edge:]   # far end = high freq side
-    else:
-        y_edge = y_local[:n_edge]    # far end = low freq side
-
-    baseline = float(np.median(y_edge))
-    noise = float(np.std(y_edge))
-    peak_height = float(y_local[idx] - baseline)
-
-    if noise <= 0 or peak_height <= 0:
-        return None
-
-    snr = peak_height / noise
-    if snr < min_snr:
-        return None
-
-    return {
-        "x_mhz":        float(x_local[idx]),
-        "y":            float(y_local[idx]),
-        "source":       "shoulder_search",
-        "predicted_mhz": pred_mhz,
-        "baseline":     baseline,
-        "noise":        noise,
-        "peak_height":  peak_height,
-        "snr":          float(snr),
-    }
-
-
 def voigt_with_baseline(
     x: np.ndarray,
     A: float,
@@ -1447,20 +1380,14 @@ def match_detected_to_expected_single(detected_x_thz: float, expected_positions_
 
 def velocity_sigma_from_sigma_thz(sigma_thz: float, centre_thz: float) -> float:
     """
-    Convert the Gaussian sigma of the Voigt fit to transverse velocity spread in m/s.
+    Convert the Gaussian sigma of the Voigt fit from THz into
+    1D transverse velocity spread in m/s.
 
-    Following the method of both reference theses (Uierlings 2021, Schindler 2011),
-    the transverse velocity is derived from the Gaussian FWHM of the absorption peak:
+    Uses:
+        sigma_v = c * sigma_nu / nu0
 
-        v_trans = FWHM_G * c / nu0
-
-    where FWHM_G = 2*sqrt(2*ln2) * sigma = 2.3548 * sigma.
-
-    This gives the characteristic transverse velocity (most-probable-speed equivalent
-    in the collimated beam) consistent with the design documents.
-
-    Note: the result is labelled velocity_sigma_ms in the output for historical reasons,
-    but physically represents the transverse velocity corresponding to FWHM_G.
+    Since both sigma_thz and centre_thz are in THz:
+        sigma_v = c * sigma_thz / centre_thz
     """
     sigma_thz = float(sigma_thz)
     centre_thz = float(centre_thz)
@@ -1468,9 +1395,7 @@ def velocity_sigma_from_sigma_thz(sigma_thz: float, centre_thz: float) -> float:
     if not np.isfinite(sigma_thz) or not np.isfinite(centre_thz) or centre_thz <= 0:
         return np.nan
 
-    SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))  # 2.3548
-    fwhm_g_thz = SIGMA_TO_FWHM * sigma_thz
-    return float(C_LIGHT * fwhm_g_thz / centre_thz)
+    return float(C_LIGHT * sigma_thz / centre_thz)
 
 def beam_speed_from_ec_temp(ec_temp_c: Optional[float], cfg: AnalysisConfig) -> float:
     """
@@ -1709,29 +1634,23 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
             idx0 = int(np.argmin(np.abs(x_fit - x0)))
             A0 = max(1e-6, float(y_fit_flat[idx0] - c0_guess))
 
-        # Natural linewidth of Dy 421 nm: Γ/2π = 32.2 MHz → gamma HWHM = 1.61e-5 THz
-        # sigma is the Gaussian (Doppler) component — this is what we measure.
-        # For a ~10 m/s transverse velocity: sigma ≈ 1.2e-5 THz (~12 MHz)
-        # The fit is initialised with sigma > gamma to prefer Gaussian-dominated solutions
-        # and avoid the sigma/gamma swap degeneracy.
-        GAMMA_NATURAL_THZ = 1.61e-5   # natural linewidth HWHM in THz
-        gamma0 = GAMMA_NATURAL_THZ    # start at natural linewidth
-        sigma0 = 1.2e-5               # start at expected Doppler sigma ~12 MHz
+        sigma0 = 6e-6
+        gamma0 = 6e-6
 
         p0.extend([A0, x0, sigma0, gamma0])
 
         lower_bounds.extend([
-            0.0,                      # amplitude
-            x0 - 5e-5,                # centre — ±50 MHz
-            5e-6,                     # sigma — min ~5 MHz (physically motivated)
-            1e-6,                     # gamma — free, can go to zero
+            0.0,          # amplitude
+            x0 - 5e-5,    # centre — ±50 MHz
+            1e-6,         # sigma
+            1e-6          # gamma
         ])
 
         upper_bounds.extend([
             0.05,
             x0 + 5e-5,
-            5e-5,                     # sigma — max ~50 MHz
-            3e-5,                     # gamma — max ~30 MHz (natural + some power broadening)
+            5e-5,
+            5e-5
         ])
 
     popt, pcov = curve_fit(
@@ -2982,64 +2901,15 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
         x_max_mhz=float(np.max(x_mhz)),
     )
 
-    # Quick Voigt fit of Dy164 so we can subtract its tail before searching for Dy163.
-    # This is the cleanest baseline for the Dy163 shoulder search — we know exactly
-    # what Dy164 contributes at the Dy163 position from its own fit.
-    dy164_mhz = None
-    y_dy164_subtracted = y_detect.copy()
-
-    if isotope_assignment:
-        for _, info in isotope_assignment.items():
-            if info.get("expected_label") == "Dy164":
-                dy164_mhz = float(thz_to_mhz(info["detected_x_thz"], cfg.f_ref_thz))
-                break
-
-    if dy164_mhz is not None:
-        try:
-            # Fit Dy164 alone in a narrow window around its peak
-            fit_hw = 80.0  # MHz half-width for the Dy164 fit window
-            mask164 = (x_mhz > dy164_mhz - fit_hw) & (x_mhz < dy164_mhz + fit_hw)
-            if np.sum(mask164) > 20:
-                x164 = x_mhz[mask164]
-                y164 = y_detect[mask164]
-                # Initial guesses
-                A0    = float(np.max(y164) - np.median(y164))
-                sig0  = 12e-3   # ~12 MHz in MHz units
-                gam0  = 5e-3
-                p0    = [np.median(y164), 0.0, dy164_mhz, A0, sig0, gam0]
-                x164_thz = cfg.f_ref_thz + x164 / 1e6
-                x0_thz   = cfg.f_ref_thz + dy164_mhz / 1e6
-                from scipy.optimize import curve_fit as _cf
-                def _voigt_mhz(xm, c0, c1, x0, A, sigma, gamma):
-                    return c0 + c1*(xm-x0) + A * voigt_profile(xm-x0, abs(sigma), abs(gamma))
-                popt, _ = _cf(_voigt_mhz, x164, y164, p0=p0, maxfev=2000)
-                # Evaluate Dy164 model across full x range and subtract
-                dy164_model = _voigt_mhz(x_mhz, *popt)
-                baseline_only = popt[0] + popt[1] * (x_mhz - popt[2])
-                y_dy164_subtracted = y_detect - (dy164_model - baseline_only)
-        except Exception:
-            pass  # If fit fails, fall back to raw signal
-
     for iso, pred_mhz in predicted:
-        # For Dy163 use the Dy164-subtracted signal so its shoulder is clearly visible
-        if iso == "Dy163":
-            peak = find_local_peak_near_prediction(
-                x_mhz=x_mhz,
-                y=y_dy164_subtracted,
-                pred_mhz=pred_mhz,
-                window_mhz=cfg.local_search_window_mhz,
-                min_snr=max(1.5, cfg.local_search_min_snr * 0.5),
-                edge_fraction=cfg.local_search_edge_fraction,
-            )
-        else:
-            peak = find_local_peak_near_prediction(
-                x_mhz=x_mhz,
-                y=y_detect,
-                pred_mhz=pred_mhz,
-                window_mhz=cfg.local_search_window_mhz,
-                min_snr=cfg.local_search_min_snr,
-                edge_fraction=cfg.local_search_edge_fraction,
-            )
+        peak = find_local_peak_near_prediction(
+            x_mhz=x_mhz,
+            y=y_detect,
+            pred_mhz=pred_mhz,
+            window_mhz=cfg.local_search_window_mhz,
+            min_snr=cfg.local_search_min_snr,
+            edge_fraction=cfg.local_search_edge_fraction,
+        )
 
         if peak is not None:
             peak["x"] = cfg.f_ref_thz + peak["x_mhz"] / 1e6
@@ -3307,23 +3177,8 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
     if per_ramp_analysis is not None:
         summary_df = per_ramp_analysis.get("per_ramp_summary_df")
         if summary_df is not None and not summary_df.empty and "centre_std_mhz" in summary_df.columns:
-            # Use jitter from the primary isotope (Dy164) only.
-            # Averaging across all peaks is unreliable because weak peaks like Dy161
-            # have very large centre_std_mhz that would over-correct the jitter subtraction.
-            primary_iso = "Dy164"
-            iso_col = next((c for c in ["assigned_isotope", "isotope"] if c in summary_df.columns), None)
-            if iso_col is not None:
-                primary_row = summary_df[summary_df[iso_col].str.strip() == primary_iso]
-            else:
-                primary_row = pd.DataFrame()
-
-            if not primary_row.empty:
-                mean_jitter_mhz = float(primary_row["centre_std_mhz"].iloc[0])
-            else:
-                # Fall back to median across strong peaks only (exclude outliers > 20 MHz)
-                vals = summary_df["centre_std_mhz"].dropna()
-                vals = vals[vals < 20.0]
-                mean_jitter_mhz = float(vals.median()) if len(vals) > 0 else 0.0
+            # Mean jitter std across all fitted peaks, converted to THz
+            mean_jitter_mhz = float(summary_df["centre_std_mhz"].dropna().mean())
             cfg._per_ramp_jitter_sigma_thz = mean_jitter_mhz * 1e-6
         else:
             cfg._per_ramp_jitter_sigma_thz = None

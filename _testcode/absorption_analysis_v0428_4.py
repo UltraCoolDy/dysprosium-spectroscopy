@@ -1447,20 +1447,14 @@ def match_detected_to_expected_single(detected_x_thz: float, expected_positions_
 
 def velocity_sigma_from_sigma_thz(sigma_thz: float, centre_thz: float) -> float:
     """
-    Convert the Gaussian sigma of the Voigt fit to transverse velocity spread in m/s.
+    Convert the Gaussian sigma of the Voigt fit from THz into
+    1D transverse velocity spread in m/s.
 
-    Following the method of both reference theses (Uierlings 2021, Schindler 2011),
-    the transverse velocity is derived from the Gaussian FWHM of the absorption peak:
+    Uses:
+        sigma_v = c * sigma_nu / nu0
 
-        v_trans = FWHM_G * c / nu0
-
-    where FWHM_G = 2*sqrt(2*ln2) * sigma = 2.3548 * sigma.
-
-    This gives the characteristic transverse velocity (most-probable-speed equivalent
-    in the collimated beam) consistent with the design documents.
-
-    Note: the result is labelled velocity_sigma_ms in the output for historical reasons,
-    but physically represents the transverse velocity corresponding to FWHM_G.
+    Since both sigma_thz and centre_thz are in THz:
+        sigma_v = c * sigma_thz / centre_thz
     """
     sigma_thz = float(sigma_thz)
     centre_thz = float(centre_thz)
@@ -1468,9 +1462,7 @@ def velocity_sigma_from_sigma_thz(sigma_thz: float, centre_thz: float) -> float:
     if not np.isfinite(sigma_thz) or not np.isfinite(centre_thz) or centre_thz <= 0:
         return np.nan
 
-    SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))  # 2.3548
-    fwhm_g_thz = SIGMA_TO_FWHM * sigma_thz
-    return float(C_LIGHT * fwhm_g_thz / centre_thz)
+    return float(C_LIGHT * sigma_thz / centre_thz)
 
 def beam_speed_from_ec_temp(ec_temp_c: Optional[float], cfg: AnalysisConfig) -> float:
     """
@@ -1709,29 +1701,66 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
             idx0 = int(np.argmin(np.abs(x_fit - x0)))
             A0 = max(1e-6, float(y_fit_flat[idx0] - c0_guess))
 
-        # Natural linewidth of Dy 421 nm: Γ/2π = 32.2 MHz → gamma HWHM = 1.61e-5 THz
-        # sigma is the Gaussian (Doppler) component — this is what we measure.
-        # For a ~10 m/s transverse velocity: sigma ≈ 1.2e-5 THz (~12 MHz)
-        # The fit is initialised with sigma > gamma to prefer Gaussian-dominated solutions
-        # and avoid the sigma/gamma swap degeneracy.
-        GAMMA_NATURAL_THZ = 1.61e-5   # natural linewidth HWHM in THz
-        gamma0 = GAMMA_NATURAL_THZ    # start at natural linewidth
-        sigma0 = 1.2e-5               # start at expected Doppler sigma ~12 MHz
+        # Estimate sigma from the peak shape, using both sides where uncontaminated.
+        # For the right side, we find the valley minimum between this peak and the
+        # nearest right neighbour — this is the natural boundary of this peak's shape
+        # without contamination from the shoulder. We then use the FWHM from the
+        # left side + the right side up to that valley.
+        try:
+            # Find the nearest peak to the right of x0 (could be a neighbour like Dy163)
+            right_neighbours = [xn for xn in x0_guesses if xn > x0]
+            right_boundary = x0 + 1e-4  # default: 100 MHz right of centre
+
+            if len(right_neighbours) > 0:
+                x_right_neighbour = float(np.min(right_neighbours))
+                # Find the valley minimum between x0 and the right neighbour
+                valley_mask = (x_fit > x0) & (x_fit < x_right_neighbour)
+                if np.sum(valley_mask) > 5:
+                    valley_y = y_fit_flat[valley_mask]
+                    valley_x = x_fit[valley_mask]
+                    valley_idx = int(np.argmin(valley_y))
+                    right_boundary = float(valley_x[valley_idx])
+
+            # Build a symmetric-ish window: full left side, right side up to valley
+            window_mask = (x_fit >= x0 - 1e-4) & (x_fit <= right_boundary)
+            if np.sum(window_mask) > 10:
+                xw = x_fit[window_mask]
+                yw = y_fit_flat[window_mask] - c0_guess
+                half_max = A0 * 0.5
+                above = yw > half_max
+                if np.any(above):
+                    hw_idx = np.where(above)[0]
+                    fwhm_est = float(xw[hw_idx[-1]] - xw[hw_idx[0]])
+                    # If right_boundary cut us short, double the left HWHM instead
+                    left_hwhm = float(x0 - xw[hw_idx[0]])
+                    right_hwhm = float(xw[hw_idx[-1]] - x0)
+                    if right_hwhm < left_hwhm * 0.5:
+                        # Right side is truncated by valley — mirror the left side
+                        fwhm_est = 2.0 * left_hwhm
+                    fwhm_est = max(fwhm_est, 5e-6)
+                    sigma0 = float(np.clip(fwhm_est / 2.355, 5e-6, 3e-5))
+                else:
+                    sigma0 = 1.2e-5
+            else:
+                sigma0 = 1.2e-5
+        except Exception:
+            sigma0 = 1.2e-5
+        gamma0 = sigma0 * 0.5  # start with Gaussian-dominated Voigt
 
         p0.extend([A0, x0, sigma0, gamma0])
 
         lower_bounds.extend([
-            0.0,                      # amplitude
-            x0 - 5e-5,                # centre — ±50 MHz
-            5e-6,                     # sigma — min ~5 MHz (physically motivated)
-            1e-6,                     # gamma — free, can go to zero
+            0.0,          # amplitude
+            x0 - 5e-5,    # centre — ±50 MHz
+            1e-6,         # sigma — keep floor low, initial guess does the real work
+            1e-6          # gamma
         ])
 
         upper_bounds.extend([
             0.05,
             x0 + 5e-5,
-            5e-5,                     # sigma — max ~50 MHz
-            3e-5,                     # gamma — max ~30 MHz (natural + some power broadening)
+            5e-5,
+            5e-5
         ])
 
     popt, pcov = curve_fit(

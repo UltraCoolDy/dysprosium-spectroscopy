@@ -6,6 +6,7 @@ __pycache__/
 *.npz
 *.csv
 data_acq/
+ec_sweep_analysis/
 *.png
 
 # OS / editor

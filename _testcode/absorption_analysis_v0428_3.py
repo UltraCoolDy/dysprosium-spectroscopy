@@ -1447,20 +1447,14 @@ def match_detected_to_expected_single(detected_x_thz: float, expected_positions_
 
 def velocity_sigma_from_sigma_thz(sigma_thz: float, centre_thz: float) -> float:
     """
-    Convert the Gaussian sigma of the Voigt fit to transverse velocity spread in m/s.
+    Convert the Gaussian sigma of the Voigt fit from THz into
+    1D transverse velocity spread in m/s.
 
-    Following the method of both reference theses (Uierlings 2021, Schindler 2011),
-    the transverse velocity is derived from the Gaussian FWHM of the absorption peak:
+    Uses:
+        sigma_v = c * sigma_nu / nu0
 
-        v_trans = FWHM_G * c / nu0
-
-    where FWHM_G = 2*sqrt(2*ln2) * sigma = 2.3548 * sigma.
-
-    This gives the characteristic transverse velocity (most-probable-speed equivalent
-    in the collimated beam) consistent with the design documents.
-
-    Note: the result is labelled velocity_sigma_ms in the output for historical reasons,
-    but physically represents the transverse velocity corresponding to FWHM_G.
+    Since both sigma_thz and centre_thz are in THz:
+        sigma_v = c * sigma_thz / centre_thz
     """
     sigma_thz = float(sigma_thz)
     centre_thz = float(centre_thz)
@@ -1468,9 +1462,7 @@ def velocity_sigma_from_sigma_thz(sigma_thz: float, centre_thz: float) -> float:
     if not np.isfinite(sigma_thz) or not np.isfinite(centre_thz) or centre_thz <= 0:
         return np.nan
 
-    SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))  # 2.3548
-    fwhm_g_thz = SIGMA_TO_FWHM * sigma_thz
-    return float(C_LIGHT * fwhm_g_thz / centre_thz)
+    return float(C_LIGHT * sigma_thz / centre_thz)
 
 def beam_speed_from_ec_temp(ec_temp_c: Optional[float], cfg: AnalysisConfig) -> float:
     """
@@ -1709,29 +1701,44 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
             idx0 = int(np.argmin(np.abs(x_fit - x0)))
             A0 = max(1e-6, float(y_fit_flat[idx0] - c0_guess))
 
-        # Natural linewidth of Dy 421 nm: Γ/2π = 32.2 MHz → gamma HWHM = 1.61e-5 THz
-        # sigma is the Gaussian (Doppler) component — this is what we measure.
-        # For a ~10 m/s transverse velocity: sigma ≈ 1.2e-5 THz (~12 MHz)
-        # The fit is initialised with sigma > gamma to prefer Gaussian-dominated solutions
-        # and avoid the sigma/gamma swap degeneracy.
-        GAMMA_NATURAL_THZ = 1.61e-5   # natural linewidth HWHM in THz
-        gamma0 = GAMMA_NATURAL_THZ    # start at natural linewidth
-        sigma0 = 1.2e-5               # start at expected Doppler sigma ~12 MHz
+        # Estimate sigma from data half-width at half-maximum near this peak.
+        # This gives a much better initial guess than a hardcoded value and prevents
+        # the optimizer getting stuck with sigma collapsed to the lower bound.
+        try:
+            hw_mask = np.abs(x_fit - x0) < 1e-4  # ±100 MHz search window
+            if np.sum(hw_mask) > 10:
+                xw = x_fit[hw_mask]
+                yw = y_fit_flat[hw_mask] - c0_guess
+                half_max = A0 * 0.5
+                above = yw > half_max
+                if np.any(above):
+                    hw_idx = np.where(above)[0]
+                    fwhm_est = float(xw[hw_idx[-1]] - xw[hw_idx[0]])
+                    fwhm_est = max(fwhm_est, 5e-6)  # at least 5 MHz
+                    # For a Voigt, FWHM ≈ 2.355*sigma when Gaussian-dominated
+                    sigma0 = float(np.clip(fwhm_est / 2.355, 5e-6, 3e-5))
+                else:
+                    sigma0 = 1.2e-5  # fallback ~12 MHz
+            else:
+                sigma0 = 1.2e-5
+        except Exception:
+            sigma0 = 1.2e-5
+        gamma0 = sigma0 * 0.5  # start with Gaussian-dominated Voigt
 
         p0.extend([A0, x0, sigma0, gamma0])
 
         lower_bounds.extend([
-            0.0,                      # amplitude
-            x0 - 5e-5,                # centre — ±50 MHz
-            5e-6,                     # sigma — min ~5 MHz (physically motivated)
-            1e-6,                     # gamma — free, can go to zero
+            0.0,          # amplitude
+            x0 - 5e-5,    # centre — ±50 MHz
+            1e-6,         # sigma — keep floor low, initial guess does the real work
+            1e-6          # gamma
         ])
 
         upper_bounds.extend([
             0.05,
             x0 + 5e-5,
-            5e-5,                     # sigma — max ~50 MHz
-            3e-5,                     # gamma — max ~30 MHz (natural + some power broadening)
+            5e-5,
+            5e-5
         ])
 
     popt, pcov = curve_fit(

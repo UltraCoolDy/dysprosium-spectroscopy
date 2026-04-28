@@ -1447,20 +1447,14 @@ def match_detected_to_expected_single(detected_x_thz: float, expected_positions_
 
 def velocity_sigma_from_sigma_thz(sigma_thz: float, centre_thz: float) -> float:
     """
-    Convert the Gaussian sigma of the Voigt fit to transverse velocity spread in m/s.
+    Convert the Gaussian sigma of the Voigt fit from THz into
+    1D transverse velocity spread in m/s.
 
-    Following the method of both reference theses (Uierlings 2021, Schindler 2011),
-    the transverse velocity is derived from the Gaussian FWHM of the absorption peak:
+    Uses:
+        sigma_v = c * sigma_nu / nu0
 
-        v_trans = FWHM_G * c / nu0
-
-    where FWHM_G = 2*sqrt(2*ln2) * sigma = 2.3548 * sigma.
-
-    This gives the characteristic transverse velocity (most-probable-speed equivalent
-    in the collimated beam) consistent with the design documents.
-
-    Note: the result is labelled velocity_sigma_ms in the output for historical reasons,
-    but physically represents the transverse velocity corresponding to FWHM_G.
+    Since both sigma_thz and centre_thz are in THz:
+        sigma_v = c * sigma_thz / centre_thz
     """
     sigma_thz = float(sigma_thz)
     centre_thz = float(centre_thz)
@@ -1468,9 +1462,7 @@ def velocity_sigma_from_sigma_thz(sigma_thz: float, centre_thz: float) -> float:
     if not np.isfinite(sigma_thz) or not np.isfinite(centre_thz) or centre_thz <= 0:
         return np.nan
 
-    SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))  # 2.3548
-    fwhm_g_thz = SIGMA_TO_FWHM * sigma_thz
-    return float(C_LIGHT * fwhm_g_thz / centre_thz)
+    return float(C_LIGHT * sigma_thz / centre_thz)
 
 def beam_speed_from_ec_temp(ec_temp_c: Optional[float], cfg: AnalysisConfig) -> float:
     """
@@ -1651,6 +1643,33 @@ def save_physics_csv(physics_df: Optional[pd.DataFrame], cfg: AnalysisConfig, ou
     physics_df.to_csv(path, index=False)
     return path
 
+def global_multi_voigt_shared_sigma(
+    x: np.ndarray,
+    mass_ratios: np.ndarray,  # sqrt(m_ref / m_i) scaling for each peak
+    c0: float,
+    c1: float,
+    sigma_ref: float,         # single shared Gaussian sigma (for reference isotope)
+    *params: float,           # groups of 3 per peak: A, x0, gamma
+) -> np.ndarray:
+    """
+    Multi-peak Voigt with a SHARED Gaussian sigma scaled by sqrt(m_ref/m_i) per isotope.
+    This breaks the sigma/gamma degeneracy by enforcing that all peaks share the same
+    Doppler broadening temperature. Only amplitude, centre, and gamma are free per peak.
+    """
+    x_ref = float(np.mean(x))
+    y = c0 + c1 * (x - x_ref)
+    n_peaks = len(mass_ratios)
+    if len(params) != 3 * n_peaks:
+        raise ValueError("params must be groups of 3: A, x0, gamma")
+    for i in range(n_peaks):
+        A     = params[3 * i]
+        x0    = params[3 * i + 1]
+        gamma = params[3 * i + 2]
+        sigma = sigma_ref * mass_ratios[i]
+        y += A * voigt_profile(x - x0, sigma, gamma)
+    return y
+
+
 def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, Any]], cfg: AnalysisConfig) -> Optional[Dict[str, Any]]:
     if len(strong_peaks) == 0:
         return None
@@ -1709,109 +1728,227 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
             idx0 = int(np.argmin(np.abs(x_fit - x0)))
             A0 = max(1e-6, float(y_fit_flat[idx0] - c0_guess))
 
-        # Natural linewidth of Dy 421 nm: Γ/2π = 32.2 MHz → gamma HWHM = 1.61e-5 THz
-        # sigma is the Gaussian (Doppler) component — this is what we measure.
-        # For a ~10 m/s transverse velocity: sigma ≈ 1.2e-5 THz (~12 MHz)
-        # The fit is initialised with sigma > gamma to prefer Gaussian-dominated solutions
-        # and avoid the sigma/gamma swap degeneracy.
-        GAMMA_NATURAL_THZ = 1.61e-5   # natural linewidth HWHM in THz
-        gamma0 = GAMMA_NATURAL_THZ    # start at natural linewidth
-        sigma0 = 1.2e-5               # start at expected Doppler sigma ~12 MHz
+        # Estimate sigma from the peak shape, using both sides where uncontaminated.
+        # For the right side, we find the valley minimum between this peak and the
+        # nearest right neighbour — this is the natural boundary of this peak's shape
+        # without contamination from the shoulder. We then use the FWHM from the
+        # left side + the right side up to that valley.
+        try:
+            # Find the nearest peak to the right of x0 (could be a neighbour like Dy163)
+            right_neighbours = [xn for xn in x0_guesses if xn > x0]
+            right_boundary = x0 + 1e-4  # default: 100 MHz right of centre
+
+            if len(right_neighbours) > 0:
+                x_right_neighbour = float(np.min(right_neighbours))
+                # Find the valley minimum between x0 and the right neighbour
+                valley_mask = (x_fit > x0) & (x_fit < x_right_neighbour)
+                if np.sum(valley_mask) > 5:
+                    valley_y = y_fit_flat[valley_mask]
+                    valley_x = x_fit[valley_mask]
+                    valley_idx = int(np.argmin(valley_y))
+                    right_boundary = float(valley_x[valley_idx])
+
+            # Build a symmetric-ish window: full left side, right side up to valley
+            window_mask = (x_fit >= x0 - 1e-4) & (x_fit <= right_boundary)
+            if np.sum(window_mask) > 10:
+                xw = x_fit[window_mask]
+                yw = y_fit_flat[window_mask] - c0_guess
+                half_max = A0 * 0.5
+                above = yw > half_max
+                if np.any(above):
+                    hw_idx = np.where(above)[0]
+                    fwhm_est = float(xw[hw_idx[-1]] - xw[hw_idx[0]])
+                    # If right_boundary cut us short, double the left HWHM instead
+                    left_hwhm = float(x0 - xw[hw_idx[0]])
+                    right_hwhm = float(xw[hw_idx[-1]] - x0)
+                    if right_hwhm < left_hwhm * 0.5:
+                        # Right side is truncated by valley — mirror the left side
+                        fwhm_est = 2.0 * left_hwhm
+                    fwhm_est = max(fwhm_est, 5e-6)
+                    sigma0 = float(np.clip(fwhm_est / 2.355, 5e-6, 3e-5))
+                else:
+                    sigma0 = 1.2e-5
+            else:
+                sigma0 = 1.2e-5
+        except Exception:
+            sigma0 = 1.2e-5
+        gamma0 = sigma0 * 0.5  # start with Gaussian-dominated Voigt
 
         p0.extend([A0, x0, sigma0, gamma0])
 
         lower_bounds.extend([
-            0.0,                      # amplitude
-            x0 - 5e-5,                # centre — ±50 MHz
-            5e-6,                     # sigma — min ~5 MHz (physically motivated)
-            1e-6,                     # gamma — free, can go to zero
+            0.0,          # amplitude
+            x0 - 5e-5,    # centre — ±50 MHz
+            1e-6,         # sigma — keep floor low, initial guess does the real work
+            1e-6          # gamma
         ])
 
         upper_bounds.extend([
             0.05,
             x0 + 5e-5,
-            5e-5,                     # sigma — max ~50 MHz
-            3e-5,                     # gamma — max ~30 MHz (natural + some power broadening)
+            5e-5,
+            5e-5
         ])
 
+    # --- Shared-sigma fit ---
+    # Fit a single Gaussian sigma (shared across all peaks, scaled by sqrt(m_ref/m_i))
+    # with independent gamma per peak. This breaks the sigma/gamma degeneracy that
+    # occurs when peaks are close together (e.g. Dy164 + Dy163 shoulder).
+    # Reference isotope mass is Dy164 = 163.929 u.
+    MASS_DY164 = 163.929
+    ISOTOPE_MASSES = {
+        "Dy164": 163.929, "Dy163": 162.929, "Dy162": 161.927,
+        "Dy161": 160.927, "Dy160": 159.925,
+    }
+
+    # Determine mass for each peak from its label/assignment
+    expected_positions = cfg.expected_peak_positions_thz or default_expected_peaks()
+    peak_masses = []
+    for x0 in x0_guesses:
+        assignment = match_detected_to_expected_single(float(x0), expected_positions)
+        iso = assignment.get("expected_label", "Dy164") if assignment else "Dy164"
+        peak_masses.append(ISOTOPE_MASSES.get(iso, MASS_DY164))
+
+    # sqrt(m_ref / m_i) — heavier isotope has smaller Doppler width
+    mass_ratios = np.array([np.sqrt(MASS_DY164 / m) for m in peak_masses])
+
+    # Use the mean sigma0 across peaks as the shared sigma initial guess
+    sigma0_values = []
+    for j in range(len(x0_guesses)):
+        base_j = 2 + 4 * j
+        sigma0_values.append(p0[base_j + 2])
+    sigma_ref_0 = float(np.mean(sigma0_values))
+
+    # Build shared-sigma p0 and bounds: [c0, c1, sigma_ref, A0, x0, gamma0, A1, x1, gamma1, ...]
+    p0_shared = [p0[0], p0[1], sigma_ref_0]
+    lb_shared = [lower_bounds[0], lower_bounds[1], 5e-6]
+    ub_shared = [upper_bounds[0], upper_bounds[1], 4e-5]
+    for j in range(len(x0_guesses)):
+        base_j = 2 + 4 * j
+        p0_shared.extend([p0[base_j], p0[base_j + 1], p0[base_j + 3]])  # A, x0, gamma
+        lb_shared.extend([lower_bounds[base_j], lower_bounds[base_j + 1], 1e-6])
+        ub_shared.extend([upper_bounds[base_j], upper_bounds[base_j + 1], 5e-5])
+
+    shared_fit_ok = False
+    try:
+        def _shared_model(x_in, *params):
+            return global_multi_voigt_shared_sigma(x_in, mass_ratios, *params)
+
+        popt_shared, pcov_shared = curve_fit(
+            _shared_model, x_fit, y_fit_flat,
+            p0=p0_shared, bounds=(lb_shared, ub_shared), maxfev=100000,
+        )
+        shared_fit_ok = True
+    except Exception:
+        shared_fit_ok = False
+
+    # Fall back to independent-width fit if shared-sigma fails
+    if shared_fit_ok:
+        sigma_ref_fit = float(popt_shared[2])
+        perr_shared = np.sqrt(np.diag(pcov_shared))
+        c0_fit = float(popt_shared[0])
+        c1_fit = float(popt_shared[1])
+
+        y_model_flat = _shared_model(x_fit, *popt_shared)
+        baseline_fit = baseline_prefit + (c0_fit - 1.0) + c1_fit * (x_fit - x_ref)
+        y_model = baseline_fit + (y_model_flat - c0_fit - c1_fit * (x_fit - x_ref))
+        resid = y_fit - y_model
+        resid_rms = float(np.sqrt(np.mean(resid**2)))
+
+        fit_results = []
+        for i, lbl in enumerate(peak_labels):
+            base = 3 + 3 * i
+            A_fit    = float(popt_shared[base])
+            x0_fit   = float(popt_shared[base + 1])
+            gamma_fit = float(popt_shared[base + 2])
+            sigma_fit = float(sigma_ref_fit * mass_ratios[i])
+
+            A_err    = float(perr_shared[base])
+            x0_err   = float(perr_shared[base + 1])
+            gamma_err = float(perr_shared[base + 2])
+
+            fwhm_voigt_thz = voigt_fwhm_from_sigma_gamma(sigma_fit, gamma_fit)
+            assignment = match_detected_to_expected_single(x0_fit, expected_positions)
+
+            fit_results.append({
+                "fit_type": "global_shared_sigma_prefit_baseline",
+                "peak_label": lbl,
+                "centre_thz": x0_fit,
+                "centre_err_thz": x0_err,
+                "amplitude": A_fit,
+                "amplitude_err": A_err,
+                "sigma_thz": sigma_fit,
+                "sigma_err_thz": np.nan,
+                "gamma_thz": gamma_fit,
+                "gamma_err_thz": gamma_err,
+                "baseline_c0": c0_fit,
+                "baseline_c0_err": float(perr_shared[0]),
+                "baseline_c1": c1_fit,
+                "baseline_c1_err": float(perr_shared[1]),
+                "fwhm_mhz": float(fwhm_voigt_thz * 1e6),
+                "fwhm_err_mhz": np.nan,
+                "isotope_assignment": assignment,
+            })
+
+        return {
+            "fit_type": "global_shared_sigma_prefit_baseline",
+            "sigma_ref_thz": sigma_ref_fit,
+            "x_fit": x_fit,
+            "y_fit": y_fit,
+            "y_fit_flat": y_fit_flat,
+            "baseline_prefit": baseline_prefit,
+            "baseline_fit": baseline_fit,
+            "y_model_flat": y_model_flat,
+            "y_model": y_model,
+            "resid": resid,
+            "resid_rms": resid_rms,
+            "fit_results": fit_results,
+        }
+
+    # --- Fallback: independent-width fit (used only if shared-sigma fit fails) ---
     popt, pcov = curve_fit(
         global_multi_voigt_with_baseline,
-        x_fit,
-        y_fit_flat,
-        p0=p0,
-        bounds=(lower_bounds, upper_bounds),
-        maxfev=100000,
+        x_fit, y_fit_flat,
+        p0=p0, bounds=(lower_bounds, upper_bounds), maxfev=100000,
     )
 
     y_model_flat = global_multi_voigt_with_baseline(x_fit, *popt)
-
-    # Convert the model back to the original ratio scale for plotting and residuals
-    c0_fit = popt[0]
-    c1_fit = popt[1]
+    c0_fit = popt[0]; c1_fit = popt[1]
     baseline_fit = baseline_prefit + (c0_fit - 1.0) + c1_fit * (x_fit - x_ref)
     y_model = baseline_fit + (y_model_flat - c0_fit - c1_fit * (x_fit - x_ref))
-
     resid = y_fit - y_model
     resid_rms = float(np.sqrt(np.mean(resid**2)))
-
     perr = np.sqrt(np.diag(pcov))
-
-    c0_fit = popt[0]
-    c1_fit = popt[1]
-    c0_err = perr[0]
-    c1_err = perr[1]
-
-    expected_positions = cfg.expected_peak_positions_thz or default_expected_peaks()
+    c0_err = perr[0]; c1_err = perr[1]
 
     fit_results = []
     for i, lbl in enumerate(peak_labels):
-        base = 2 + 4 * i  # now offset by 2 (c0 and c1) instead of 1
-
-        A_fit = popt[base]
-        x0_fit = popt[base + 1]
-        sigma_fit = popt[base + 2]
-        gamma_fit = popt[base + 3]
-
-        A_err = perr[base]
-        x0_err = perr[base + 1]
-        sigma_err = perr[base + 2]
-        gamma_err = perr[base + 3]
-
+        base = 2 + 4 * i
+        A_fit = popt[base]; x0_fit = popt[base+1]
+        sigma_fit = popt[base+2]; gamma_fit = popt[base+3]
+        A_err = perr[base]; x0_err = perr[base+1]
+        sigma_err = perr[base+2]; gamma_err = perr[base+3]
         fwhm_voigt_thz = voigt_fwhm_from_sigma_gamma(sigma_fit, gamma_fit)
-
         assignment = match_detected_to_expected_single(float(x0_fit), expected_positions)
-
         fit_results.append({
-            "fit_type": "global_independent_width",
+            "fit_type": "global_independent_width_prefit_baseline",
             "peak_label": lbl,
-            "centre_thz": float(x0_fit),
-            "centre_err_thz": float(x0_err),
-            "amplitude": float(A_fit),
-            "amplitude_err": float(A_err),
-            "sigma_thz": float(sigma_fit),
-            "sigma_err_thz": float(sigma_err),
-            "gamma_thz": float(gamma_fit),
-            "gamma_err_thz": float(gamma_err),
-            "baseline_c0": float(c0_fit),
-            "baseline_c0_err": float(c0_err),
-            "baseline_c1": float(c1_fit),
-            "baseline_c1_err": float(c1_err),
-            "fwhm_mhz": float(fwhm_voigt_thz * 1e6),
-            "fwhm_err_mhz": np.nan,
+            "centre_thz": float(x0_fit), "centre_err_thz": float(x0_err),
+            "amplitude": float(A_fit), "amplitude_err": float(A_err),
+            "sigma_thz": float(sigma_fit), "sigma_err_thz": float(sigma_err),
+            "gamma_thz": float(gamma_fit), "gamma_err_thz": float(gamma_err),
+            "baseline_c0": float(c0_fit), "baseline_c0_err": float(c0_err),
+            "baseline_c1": float(c1_fit), "baseline_c1_err": float(c1_err),
+            "fwhm_mhz": float(fwhm_voigt_thz * 1e6), "fwhm_err_mhz": np.nan,
             "isotope_assignment": assignment,
         })
 
     return {
         "fit_type": "global_independent_width_prefit_baseline",
-        "x_fit": x_fit,
-        "y_fit": y_fit,
-        "y_fit_flat": y_fit_flat,
-        "baseline_prefit": baseline_prefit,
-        "baseline_fit": baseline_fit,
-        "y_model_flat": y_model_flat,
-        "y_model": y_model,
-        "resid": resid,
-        "resid_rms": resid_rms,
+        "x_fit": x_fit, "y_fit": y_fit, "y_fit_flat": y_fit_flat,
+        "baseline_prefit": baseline_prefit, "baseline_fit": baseline_fit,
+        "y_model_flat": y_model_flat, "y_model": y_model,
+        "resid": resid, "resid_rms": resid_rms,
         "fit_results": fit_results,
     }
 
