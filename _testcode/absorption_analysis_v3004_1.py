@@ -17,7 +17,6 @@ from scipy.special import voigt_profile
 import itertools
 
 C_LIGHT = 299_792_458.0
-GAMMA_LASER_THZ = 2e-6   # probe laser linewidth HWHM ~2 MHz
 
 
 @dataclass
@@ -1352,7 +1351,7 @@ def fit_single_peak(avg: Dict[str, Any], strong_peaks: List[Dict[str, Any]], cfg
 
     # Initial guesses in THz
     sigma_guess = 6e-6
-    gamma_guess = GAMMA_LASER_THZ
+    gamma_guess = 6e-6
     c1_guess = 0.0
 
     # Bounds in THz
@@ -1360,7 +1359,7 @@ def fit_single_peak(avg: Dict[str, Any], strong_peaks: List[Dict[str, Any]], cfg
         0.0,                 # A
         x0_guess - 3e-5,     # x0
         1e-6,                # sigma
-        GAMMA_LASER_THZ * 0.5,   # gamma lower bound
+        1e-6,                # gamma
         c0_guess - 0.01,     # c0
         -100.0,              # c1
     ]
@@ -1368,7 +1367,7 @@ def fit_single_peak(avg: Dict[str, Any], strong_peaks: List[Dict[str, Any]], cfg
         0.05,                # A
         x0_guess + 5e-5,     # x0 — ±50 MHz to match global fit
         5e-5,                # sigma — raised to match global fit upper bound
-        GAMMA_LASER_THZ * 3.0,   # gamma upper bound
+        5e-5,                # gamma — raised to match global fit upper bound
         c0_guess + 0.01,     # c0
         100.0,               # c1
     ]
@@ -1450,12 +1449,18 @@ def velocity_sigma_from_sigma_thz(sigma_thz: float, centre_thz: float) -> float:
     """
     Convert the Gaussian sigma of the Voigt fit to transverse velocity spread in m/s.
 
-    Returns the 1-sigma transverse velocity spread:
+    Following the method of both reference theses (Uierlings 2021, Schindler 2011),
+    the transverse velocity is derived from the Gaussian FWHM of the absorption peak:
 
-        v_sigma = sigma_thz * c / nu0
+        v_trans = FWHM_G * c / nu0
 
-    This is the standard deviation of the transverse velocity distribution,
-    consistent with the design documents and previous analysis code.
+    where FWHM_G = 2*sqrt(2*ln2) * sigma = 2.3548 * sigma.
+
+    This gives the characteristic transverse velocity (most-probable-speed equivalent
+    in the collimated beam) consistent with the design documents.
+
+    Note: the result is labelled velocity_sigma_ms in the output for historical reasons,
+    but physically represents the transverse velocity corresponding to FWHM_G.
     """
     sigma_thz = float(sigma_thz)
     centre_thz = float(centre_thz)
@@ -1463,7 +1468,9 @@ def velocity_sigma_from_sigma_thz(sigma_thz: float, centre_thz: float) -> float:
     if not np.isfinite(sigma_thz) or not np.isfinite(centre_thz) or centre_thz <= 0:
         return np.nan
 
-    return float(C_LIGHT * sigma_thz / centre_thz)
+    SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))  # 2.3548
+    fwhm_g_thz = SIGMA_TO_FWHM * sigma_thz
+    return float(C_LIGHT * fwhm_g_thz / centre_thz)
 
 def beam_speed_from_ec_temp(ec_temp_c: Optional[float], cfg: AnalysisConfig) -> float:
     """
@@ -1565,13 +1572,16 @@ def build_physics_results(
         assignment = r.get("isotope_assignment")
         isotope_label = None if assignment is None else assignment.get("expected_label")
 
-        # Use the raw fit sigma directly — no jitter subtraction.
+        # Correct sigma for frequency jitter contribution (per-ramp jitter broadens the
+        # averaged Gaussian sigma). Subtract jitter in quadrature if available.
         sigma_thz_raw = r["sigma_thz"]
         jitter_sigma_thz = 0.0
         if hasattr(cfg, "_per_ramp_jitter_sigma_thz") and cfg._per_ramp_jitter_sigma_thz is not None:
             jitter_sigma_thz = float(cfg._per_ramp_jitter_sigma_thz)
 
-        sigma_thz_corrected = sigma_thz_raw  # jitter correction disabled
+        sigma_thz_corrected = sigma_thz_raw
+        if jitter_sigma_thz > 0 and sigma_thz_raw > jitter_sigma_thz:
+            sigma_thz_corrected = float(np.sqrt(sigma_thz_raw**2 - jitter_sigma_thz**2))
 
         velocity_sigma_ms = velocity_sigma_from_sigma_thz(
             sigma_thz=sigma_thz_corrected,
@@ -1699,10 +1709,13 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
             idx0 = int(np.argmin(np.abs(x_fit - x0)))
             A0 = max(1e-6, float(y_fit_flat[idx0] - c0_guess))
 
-        # Probe laser linewidth dominates the Lorentzian component (HWHM ~2 MHz).
-        # Constrain gamma to laser linewidth rather than natural linewidth to avoid
-        # sigma/gamma degeneracy and ensure correct Doppler (sigma) extraction.
-        gamma0 = GAMMA_LASER_THZ      # probe laser linewidth HWHM ~2 MHz (constrained)
+        # Natural linewidth of Dy 421 nm: Γ/2π = 32.2 MHz → gamma HWHM = 1.61e-5 THz
+        # sigma is the Gaussian (Doppler) component — this is what we measure.
+        # For a ~10 m/s transverse velocity: sigma ≈ 1.2e-5 THz (~12 MHz)
+        # The fit is initialised with sigma > gamma to prefer Gaussian-dominated solutions
+        # and avoid the sigma/gamma swap degeneracy.
+        GAMMA_NATURAL_THZ = 1.61e-5   # natural linewidth HWHM in THz
+        gamma0 = GAMMA_NATURAL_THZ    # start at natural linewidth
         sigma0 = 1.2e-5               # start at expected Doppler sigma ~12 MHz
 
         p0.extend([A0, x0, sigma0, gamma0])
@@ -1711,14 +1724,14 @@ def fit_selected_peaks_global(avg: Dict[str, Any], strong_peaks: List[Dict[str, 
             0.0,                      # amplitude
             x0 - 5e-5,                # centre — ±50 MHz
             5e-6,                     # sigma — min ~5 MHz (physically motivated)
-            GAMMA_LASER_THZ * 0.5,    # gamma lower bound
+            1e-6,                     # gamma — free, can go to zero
         ])
 
         upper_bounds.extend([
             0.05,
             x0 + 5e-5,
             5e-5,                     # sigma — max ~50 MHz
-            GAMMA_LASER_THZ * 3.0,    # gamma upper bound
+            3e-5,                     # gamma — max ~30 MHz (natural + some power broadening)
         ])
 
     popt, pcov = curve_fit(
@@ -1999,49 +2012,9 @@ def analyze_per_ramp_fits(
 
     per_ramp_summary_df = pd.DataFrame(summary_rows)
 
-    # --- Common-mode and differential jitter across all fitted peaks ---
-    # Common-mode std: std of the mean centre position across all peaks per ramp.
-    # This isolates laser/wavemeter frequency jitter (shifts all peaks together).
-    # Differential std: std of the spacing between any two peaks per ramp.
-    # This reflects ramp baseline non-linearity and per-peak fit noise.
-    jitter_stats = {}
-    if not per_ramp_df.empty and "centre_mhz" in per_ramp_df.columns:
-        # Pivot to ramp_index x peak_label matrix of centres
-        pivot = per_ramp_df.pivot_table(
-            index="ramp_index", columns="peak_label", values="centre_mhz", aggfunc="first"
-        )
-        peak_cols = pivot.columns.tolist()
-
-        if len(peak_cols) >= 2:
-            # Common-mode: mean centre across all peaks per ramp
-            common_mode = pivot.mean(axis=1)
-            jitter_stats["common_mode_std_mhz"] = float(np.std(common_mode, ddof=1))
-
-            # Differential: std of all pairwise spacings per ramp
-            spacing_stds = []
-            for i in range(len(peak_cols)):
-                for j in range(i + 1, len(peak_cols)):
-                    spacing = pivot[peak_cols[j]] - pivot[peak_cols[i]]
-                    valid = spacing.dropna()
-                    if len(valid) > 1:
-                        spacing_stds.append(float(np.std(valid, ddof=1)))
-            jitter_stats["differential_std_mhz"] = float(np.mean(spacing_stds)) if spacing_stds else np.nan
-        else:
-            jitter_stats["common_mode_std_mhz"] = np.nan
-            jitter_stats["differential_std_mhz"] = np.nan
-
-        # Per-isotope centre_std for individual isotopes used in downstream analysis
-        iso_col = "assigned_isotope"
-        if iso_col in per_ramp_df.columns:
-            for iso in per_ramp_df[iso_col].dropna().unique():
-                iso_centres = per_ramp_df.loc[per_ramp_df[iso_col] == iso, "centre_mhz"].dropna()
-                if len(iso_centres) > 1:
-                    jitter_stats[f"centre_std_{iso}_mhz"] = float(np.std(iso_centres, ddof=1))
-
     return {
         "per_ramp_df": per_ramp_df,
         "per_ramp_summary_df": per_ramp_summary_df,
-        "jitter_stats": jitter_stats,
     }
 
 def match_isotopes(strong_peaks: List[Dict[str, Any]], cfg: AnalysisConfig) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -2597,7 +2570,6 @@ def save_summary_text(
 
     if per_ramp_analysis is not None:
         per_ramp_summary_df = per_ramp_analysis.get("per_ramp_summary_df")
-        jitter_stats = per_ramp_analysis.get("jitter_stats", {})
         if per_ramp_summary_df is not None and not per_ramp_summary_df.empty:
             lines.append("Per-ramp fit summary")
             for _, row in per_ramp_summary_df.iterrows():
@@ -2605,22 +2577,19 @@ def save_summary_text(
                     f"{row['peak_label']} -> {row['assigned_isotope']} | "
                     f"n_ramps = {int(row['n_ramps'])} | "
                     f"offset mean = {row['offset_mean_mhz']:.3f} MHz | "
-                    f"centre std = {row['centre_std_mhz']:.3f} MHz"
+                    f"offset std = {row['offset_std_mhz']:.3f} MHz"
                 )
 
-            lines.append("")
-            lines.append("Scan-to-scan frequency stability")
-            cm = jitter_stats.get("common_mode_std_mhz", np.nan)
-            diff = jitter_stats.get("differential_std_mhz", np.nan)
-            if np.isfinite(cm):
-                lines.append(f"  Common-mode std (laser/wavemeter jitter) = {cm:.2f} MHz")
-            if np.isfinite(diff):
-                lines.append(f"  Differential std (ramp baseline variation) = {diff:.2f} MHz")
-            # Per-isotope stds
-            for key, val in jitter_stats.items():
-                if key.startswith("centre_std_") and key.endswith("_mhz"):
-                    iso = key[len("centre_std_"):-len("_mhz")]
-                    lines.append(f"  {iso} centre std = {val:.2f} MHz")
+            valid_stds = per_ramp_summary_df["offset_std_mhz"].dropna()
+
+            if len(valid_stds) > 0:
+                jitter_mean = float(np.mean(valid_stds))
+                jitter_median = float(np.median(valid_stds))
+
+                lines.append("")
+                lines.append("System frequency uncertainty")
+                lines.append(f"Estimated jitter (mean) = {jitter_mean:.2f} MHz")
+                lines.append(f"Estimated jitter (median) = {jitter_median:.2f} MHz")
     if physics_df is not None and not physics_df.empty:
         lines.append("")
         lines.append("==============================")
@@ -2652,14 +2621,11 @@ def save_summary_text(
 
         if per_ramp_analysis is not None:
             per_ramp_summary_df = per_ramp_analysis.get("per_ramp_summary_df")
-            jitter_stats = per_ramp_analysis.get("jitter_stats", {})
             if per_ramp_summary_df is not None and not per_ramp_summary_df.empty:
-                cm = jitter_stats.get("common_mode_std_mhz", np.nan)
-                dy164_std = jitter_stats.get("centre_std_Dy164_mhz", np.nan)
-                if np.isfinite(cm):
-                    lines.append(f"Laser/wavemeter jitter (common-mode): ±{cm:.1f} MHz")
-                if np.isfinite(dy164_std):
-                    lines.append(f"Dy164 centre uncertainty (for EC sweep error bars): ±{dy164_std:.1f} MHz")
+                valid_stds = per_ramp_summary_df["offset_std_mhz"].dropna()
+                if len(valid_stds) > 0:
+                    jitter_median = float(np.median(valid_stds))
+                    lines.append(f"Frequency uncertainty (shot-to-shot): ±{jitter_median:.1f} MHz")
         lines.append("")
 
         lines.append("Identified transitions")
@@ -3039,16 +3005,14 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
                 # Initial guesses
                 A0    = float(np.max(y164) - np.median(y164))
                 sig0  = 12e-3   # ~12 MHz in MHz units
-                gam0  = 2.0    # ~2 MHz probe laser linewidth in MHz units
+                gam0  = 5e-3
                 p0    = [np.median(y164), 0.0, dy164_mhz, A0, sig0, gam0]
                 x164_thz = cfg.f_ref_thz + x164 / 1e6
                 x0_thz   = cfg.f_ref_thz + dy164_mhz / 1e6
                 from scipy.optimize import curve_fit as _cf
                 def _voigt_mhz(xm, c0, c1, x0, A, sigma, gamma):
                     return c0 + c1*(xm-x0) + A * voigt_profile(xm-x0, abs(sigma), abs(gamma))
-                lb = [-np.inf, -np.inf, -np.inf, 0.0, 1e-3, 1.0]
-                ub = [ np.inf,  np.inf,  np.inf, np.inf, 50.0, 6.0]
-                popt, _ = _cf(_voigt_mhz, x164, y164, p0=p0, bounds=(lb, ub), maxfev=2000)
+                popt, _ = _cf(_voigt_mhz, x164, y164, p0=p0, maxfev=2000)
                 # Evaluate Dy164 model across full x range and subtract
                 dy164_model = _voigt_mhz(x_mhz, *popt)
                 baseline_only = popt[0] + popt[1] * (x_mhz - popt[2])
@@ -3343,13 +3307,28 @@ def analyze(cfg: AnalysisConfig) -> Dict[str, Any]:
     strong_csv, fit_csv = save_csvs(strong_peaks, multi_fit, isotope_assignment, cfg, outdir)
     per_ramp_csv, per_ramp_summary_csv = save_per_ramp_csvs(per_ramp_analysis, cfg, outdir)
 
-    # Store Dy164 centre std in cfg for reference (jitter correction currently disabled,
-    # but kept so build_physics_results still records it in the physics CSV).
+    # Pass per-ramp jitter into cfg so build_physics_results can correct sigma
     if per_ramp_analysis is not None:
-        jitter_stats = per_ramp_analysis.get("jitter_stats", {})
-        dy164_std = jitter_stats.get("centre_std_Dy164_mhz", None)
-        if dy164_std is not None and np.isfinite(dy164_std):
-            cfg._per_ramp_jitter_sigma_thz = dy164_std * 1e-6
+        summary_df = per_ramp_analysis.get("per_ramp_summary_df")
+        if summary_df is not None and not summary_df.empty and "centre_std_mhz" in summary_df.columns:
+            # Use jitter from the primary isotope (Dy164) only.
+            # Averaging across all peaks is unreliable because weak peaks like Dy161
+            # have very large centre_std_mhz that would over-correct the jitter subtraction.
+            primary_iso = "Dy164"
+            iso_col = next((c for c in ["assigned_isotope", "isotope"] if c in summary_df.columns), None)
+            if iso_col is not None:
+                primary_row = summary_df[summary_df[iso_col].str.strip() == primary_iso]
+            else:
+                primary_row = pd.DataFrame()
+
+            if not primary_row.empty:
+                mean_jitter_mhz = float(primary_row["centre_std_mhz"].iloc[0])
+            else:
+                # Fall back to median across strong peaks only (exclude outliers > 20 MHz)
+                vals = summary_df["centre_std_mhz"].dropna()
+                vals = vals[vals < 20.0]
+                mean_jitter_mhz = float(vals.median()) if len(vals) > 0 else 0.0
+            cfg._per_ramp_jitter_sigma_thz = mean_jitter_mhz * 1e-6
         else:
             cfg._per_ramp_jitter_sigma_thz = None
     else:
