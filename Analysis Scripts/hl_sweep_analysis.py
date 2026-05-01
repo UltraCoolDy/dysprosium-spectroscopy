@@ -42,6 +42,12 @@ OUTPUT_DIR = Path(r"C:\Users\dysprosium\labscript-suite\userlib\labscriptlib\qua
 # grouped by HL temp to help you populate this.
 HL_SWEEP_DATASETS: Dict[int, List[str]] = {
     1100: ["20260501_100507", "20260501_101451", "20260501_102003", "20260501_102232"],
+    1125: ["20260501_105420", "20260501_105630", "20260501_105850"],
+    1150: ["20260501_112947", "20260501_113156", "20260501_113429", "20260501_113646"],
+    1175: ["20260501_115656", "20260501_121011", "20260501_121253", "20260501_121534"],
+    1200: ["20260501_125807", "20260501_130023", "20260501_130239", "20260501_130518"],
+    1075: ["20260501_144837", "20260501_145329", "20260501_145544", "20260501_145803"],
+    1050: ["20260501_153212", "20260501_153602", "20260501_153923", "20260501_154613"],
 }
 
 # Discovery mode date filter — only used when HL_SWEEP_DATASETS is empty.
@@ -57,6 +63,13 @@ EC_TEMP_FIXED = 1100
 # Temperature aliases — map HL temps that are nominally the same to a canonical value.
 # e.g. 1101 -> 1100 means any folder with HL1101 is treated as HL1100.
 TEMP_ALIASES: Dict[int, int] = {
+    1124: 1125,
+    1129: 1125,
+    1149: 1150,
+    1174: 1175,
+    1179: 1175,
+    1199: 1200,
+    1201: 1200,
 }
 
 # Quality flag thresholds — datasets outside these get a WARNING but are
