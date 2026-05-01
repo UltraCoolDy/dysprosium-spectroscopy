@@ -19,7 +19,7 @@ CONFIG_JSON: Optional[Path] = Path(__file__).resolve().parent / "absorption_conf
 #   "menu"      -> show all datasets and let you choose one / many / all new
 #   "all_new"   -> automatically run every dataset that has not yet been analysed
 #   "one_latest"-> automatically run only the newest unanalyzed dataset
-MODE = "menu"
+MODE = "all_new"
 
 # If True, outputs are written into the SAME folder as the input .npz and .csv files.
 # Files are prefixed with the dataset stem, e.g. 20260326_101120_summary.txt

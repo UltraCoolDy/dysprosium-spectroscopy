@@ -1,19 +1,19 @@
 """
-ec_sweep_analysis.py
+hl_sweep_analysis.py
 ====================
-Sweep 1 analysis: EC temperature scan with fixed HL temperature.
+Sweep 2 analysis: HL temperature scan with fixed EC temperature.
 
 Loads results files for each included dataset, applies quality flags
 (warnings only), averages across repeats per temperature, and produces:
-  - ec_sweep_summary.csv     : one row per EC temp with mean +/- std
-  - ec_sweep_od_plot.png     : OD (flux proxy) vs EC temperature
-  - ec_sweep_fwhm_plot.png   : Gaussian & Voigt FWHM vs EC temperature with sqrt(T) overlay
-  - ec_sweep_overview.png    : combined 2x2 panel
+  - hl_sweep_summary.csv     : one row per HL temp with mean +/- std
+  - hl_sweep_od_plot.png     : OD (flux proxy) vs HL temperature
+  - hl_sweep_fwhm_plot.png   : Gaussian & Voigt FWHM vs HL temperature with sqrt(T) overlay
+  - hl_sweep_overview.png    : combined 2x2 panel
 
 Usage:
-  1. Populate EC_SWEEP_DATASETS below with your dataset timestamps.
+  1. Populate HL_SWEEP_DATASETS below with your dataset timestamps.
   2. Set ACQ_FOLDER and OUTPUT_DIR paths.
-  3. Run: python ec_sweep_analysis.py
+  3. Run: python hl_sweep_analysis.py
 """
 
 from __future__ import annotations
@@ -35,42 +35,32 @@ from matplotlib.ticker import MultipleLocator
 
 ACQ_FOLDER = Path(r"C:\Users\dysprosium\labscript-suite\userlib\labscriptlib\quantum_gas_microscope\Dysprosium\Spectroscopy\data_acq")
 
-OUTPUT_DIR = Path(r"C:\Users\dysprosium\labscript-suite\userlib\labscriptlib\quantum_gas_microscope\Dysprosium\Spectroscopy\ec_sweep_analysis")
+OUTPUT_DIR = Path(r"C:\Users\dysprosium\labscript-suite\userlib\labscriptlib\quantum_gas_microscope\Dysprosium\Spectroscopy\hl_sweep_analysis")
 
-# Include list: EC temp (°C) -> list of timestamp prefixes (YYYYMMDD_HHMMSS)
+# Include list: HL temp (°C) -> list of timestamp prefixes (YYYYMMDD_HHMMSS)
 # Leave empty dict {} on first run — script will print all discovered datasets
-# grouped by EC temp to help you populate this.
-EC_SWEEP_DATASETS: Dict[int, List[str]] = {
-    1000: ["20260428_134529", "20260428_135246", "20260428_142406"],
-    1025: ["20260428_151704", "20260428_151940", "20260428_152721", "20260428_153013"],
-    1050: ["20260427_155452", "20260428_115600", "20260428_115809", "20260428_120116", "20260428_120553"],
-    1075: ["20260427_165727", "20260427_165929", "20260427_170123", "20260427_170523"],
+# grouped by HL temp to help you populate this.
+HL_SWEEP_DATASETS: Dict[int, List[str]] = {
     1100: ["20260501_100507", "20260501_101451", "20260501_102003", "20260501_102232"],
 }
 
-# Discovery mode date filter — only used when EC_SWEEP_DATASETS is empty.
+# Discovery mode date filter — only used when HL_SWEEP_DATASETS is empty.
 # List dates as "YYYYMMDD" strings to limit the discovery report to specific days.
 # Leave as [] to scan all dates.
 DISCOVERY_DATES: List[str] = [
-    "20260427",
-    "20260428",
     "20260501",
 ]
 
-# Fixed HL temperature for this sweep (used for labelling only)
-HL_TEMP_FIXED = 1100
+# Fixed EC temperature for this sweep (used for labelling only)
+EC_TEMP_FIXED = 1100
 
-# Temperature aliases — map EC temps that are nominally the same to a canonical value.
-# e.g. 1001 -> 1000 means any folder with EC1001 is treated as EC1000.
+# Temperature aliases — map HL temps that are nominally the same to a canonical value.
+# e.g. 1101 -> 1100 means any folder with HL1101 is treated as HL1100.
 TEMP_ALIASES: Dict[int, int] = {
-    1001: 1000,
-    1024: 1025,
-    1051: 1050,
-    1074: 1075,
 }
 
 # Quality flag thresholds — datasets outside these get a WARNING but are
-# still included unless you remove them from EC_SWEEP_DATASETS above
+# still included unless you remove them from HL_SWEEP_DATASETS above
 JITTER_MAX_MHZ     = 12.0
 RESID_RMS_MAX      = 0.0015
 FWHM_MAX_MHZ       = 60.0
@@ -102,7 +92,6 @@ def find_all_datasets(acq_folder: Path, date_filter: List[str] = []) -> List[Dic
             for ds_dir in sorted(day_dir.iterdir()):
                 if not ds_dir.is_dir():
                     continue
-                # Apply date filter if specified (discovery mode only)
                 if date_filter:
                     ds_date = ds_dir.name[:8]
                     if ds_date not in date_filter:
@@ -120,7 +109,7 @@ def find_all_datasets(acq_folder: Path, date_filter: List[str] = []) -> List[Dic
                 ramp_summary_csv = ds_dir / f"{ds_dir.name}_per_ramp_fit_summary.csv"
 
                 if not fit_csv.exists():
-                    continue  # not yet analysed
+                    continue
 
                 datasets.append({
                     "timestamp":        timestamp,
@@ -138,23 +127,23 @@ def find_all_datasets(acq_folder: Path, date_filter: List[str] = []) -> List[Dic
 
 
 def discovery_report(datasets: List[Dict]) -> None:
-    """Print all discovered datasets grouped by EC temp — helps populate include list."""
+    """Print all discovered datasets grouped by HL temp — helps populate include list."""
     from collections import defaultdict
-    by_ec: Dict[int, List[Dict]] = defaultdict(list)
+    by_hl: Dict[int, List[Dict]] = defaultdict(list)
     for ds in datasets:
-        by_ec[ds["ec_temp"]].append(ds)
+        by_hl[ds["hl_temp"]].append(ds)
 
     print("\n" + "=" * 70)
-    print("DISCOVERY MODE — EC_SWEEP_DATASETS is empty")
+    print("DISCOVERY MODE — HL_SWEEP_DATASETS is empty")
     if DISCOVERY_DATES:
         print(f"Date filter active: {', '.join(DISCOVERY_DATES)}")
-    print("All analysed datasets found, grouped by EC temperature:")
+    print("All analysed datasets found, grouped by HL temperature:")
     print("=" * 70)
-    for ec in sorted(by_ec):
-        print(f"\n  EC = {ec}°C  (HL temps seen: {sorted({d['hl_temp'] for d in by_ec[ec]})})")
-        for ds in sorted(by_ec[ec], key=lambda d: d["timestamp"]):
+    for hl in sorted(by_hl):
+        print(f"\n  HL = {hl}°C  (EC temps seen: {sorted({d['ec_temp'] for d in by_hl[hl]})})")
+        for ds in sorted(by_hl[hl], key=lambda d: d["timestamp"]):
             print(f"    \"{ds['timestamp']}\",  # {ds['stem']}")
-    print("\nCopy the timestamps you want into EC_SWEEP_DATASETS at the top of the script.")
+    print("\nCopy the timestamps you want into HL_SWEEP_DATASETS at the top of the script.")
     print("=" * 70 + "\n")
 
 # ============================================================
@@ -177,14 +166,14 @@ def load_fit_results(ds: Dict) -> Optional[Dict]:
         print(f"  WARNING: could not read {ds['fit_csv'].name}: {e}")
         return None
 
-    # Apply temperature alias
-    ec_temp_canonical = TEMP_ALIASES.get(ds["ec_temp"], ds["ec_temp"])
+    # Apply temperature alias to HL temp (the sweep variable)
+    hl_temp_canonical = TEMP_ALIASES.get(ds["hl_temp"], ds["hl_temp"])
 
     result = {
         "stem":      ds["stem"],
         "timestamp": ds["timestamp"],
-        "ec_temp":   ec_temp_canonical,
-        "hl_temp":   ds["hl_temp"],
+        "ec_temp":   ds["ec_temp"],
+        "hl_temp":   hl_temp_canonical,
     }
 
     # ------------------------------------------------------------------
@@ -307,7 +296,7 @@ def quality_check(result: Dict) -> Tuple[bool, List[str]]:
 # ============================================================
 
 def average_by_temp(results: List[Dict]) -> pd.DataFrame:
-    """Average all key quantities across datasets at the same EC temp."""
+    """Average all key quantities across datasets at the same HL temp."""
     quantities = ["od", "fwhm_g", "fwhm_l", "fwhm_v",
                   "density", "beam_diam", "v_spread",
                   "jitter_mhz", "n_ramps", "resid_rms"]
@@ -315,9 +304,9 @@ def average_by_temp(results: List[Dict]) -> pd.DataFrame:
     df = pd.DataFrame(results)
     rows = []
 
-    for ec_temp in sorted(df["ec_temp"].unique()):
-        grp = df[df["ec_temp"] == ec_temp]
-        row = {"ec_temp": ec_temp, "n_datasets": len(grp)}
+    for hl_temp in sorted(df["hl_temp"].unique()):
+        grp = df[df["hl_temp"] == hl_temp]
+        row = {"hl_temp": hl_temp, "n_datasets": len(grp)}
         for q in quantities:
             if q not in grp.columns:
                 row[f"{q}_mean"] = np.nan
@@ -328,7 +317,7 @@ def average_by_temp(results: List[Dict]) -> pd.DataFrame:
             row[f"{q}_std"]  = np.nanstd(vals, ddof=1) if len(vals) > 1 else 0.0
         rows.append(row)
 
-    return pd.DataFrame(rows).sort_values("ec_temp").reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values("hl_temp").reset_index(drop=True)
 
 # ============================================================
 # SQRT(T) REFERENCE CURVE
@@ -343,7 +332,7 @@ def sqrt_t_reference(temps_c: np.ndarray, fwhm_ref: float, t_ref_c: float) -> np
 # ============================================================
 # PLOTTING
 
-def set_ec_xticks(ax, temps: np.ndarray, step: int = 25) -> None:
+def set_hl_xticks(ax, temps: np.ndarray, step: int = 25) -> None:
     """Set x-axis ticks at fixed intervals aligned to data points."""
     lo = int(np.floor(temps.min() / step) * step)
     hi = int(np.ceil(temps.max()  / step) * step)
@@ -368,16 +357,16 @@ STYLE = {
 def plot_od(summary: pd.DataFrame, out_path: Path) -> None:
     with plt.rc_context(STYLE):
         fig, ax = plt.subplots(figsize=(6, 4))
-        temps = summary["ec_temp"].values
+        temps = summary["hl_temp"].values
         od    = summary["od_mean"].values
         od_e  = summary["od_std"].values
 
         ax.errorbar(temps, od, yerr=od_e, fmt="o-", capsize=4,
                     color="#1f77b4", linewidth=1.5, label=PRIMARY_ISOTOPE)
-        ax.set_xlabel(f"EC Temperature (°C)  [HL fixed = {HL_TEMP_FIXED}°C]")
+        ax.set_xlabel(f"HL Temperature (°C)  [EC fixed = {EC_TEMP_FIXED}°C]")
         ax.set_ylabel("Peak Optical Depth")
-        ax.set_title(f"Flux Proxy (OD) vs EC Temperature — {PRIMARY_ISOTOPE}")
-        set_ec_xticks(ax, temps)
+        ax.set_title(f"Flux Proxy (OD) vs HL Temperature — {PRIMARY_ISOTOPE}")
+        set_hl_xticks(ax, temps)
         ax.legend()
         ax.grid(True, alpha=0.3, linestyle=":")
         fig.tight_layout()
@@ -389,7 +378,7 @@ def plot_od(summary: pd.DataFrame, out_path: Path) -> None:
 def plot_fwhm(summary: pd.DataFrame, out_path: Path) -> None:
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-        temps    = summary["ec_temp"].values
+        temps    = summary["hl_temp"].values
         fwhm_g   = summary["fwhm_g_mean"].values
         fwhm_g_e = summary["fwhm_g_std"].values
         fwhm_v   = summary["fwhm_v_mean"].values
@@ -406,10 +395,10 @@ def plot_fwhm(summary: pd.DataFrame, out_path: Path) -> None:
             sqt      = sqrt_t_reference(t_smooth, fwhm_g[mid_idx], temps[mid_idx])
             ax.plot(t_smooth, sqt, "k--", linewidth=1.2, alpha=0.6,
                     label=r"$\sqrt{T}$ scaling")
-        ax.set_xlabel(f"EC Temperature (°C)  [HL = {HL_TEMP_FIXED}°C]")
+        ax.set_xlabel(f"HL Temperature (°C)  [EC = {EC_TEMP_FIXED}°C]")
         ax.set_ylabel("Gaussian FWHM (MHz)")
-        ax.set_title(f"Gaussian Linewidth vs EC Temp ({PRIMARY_ISOTOPE})")
-        set_ec_xticks(ax, temps)
+        ax.set_title(f"Gaussian Linewidth vs HL Temp ({PRIMARY_ISOTOPE})")
+        set_hl_xticks(ax, temps)
         ax.set_ylim(bottom=0)
         ax.legend()
         ax.grid(True, alpha=0.3, linestyle=":")
@@ -425,10 +414,10 @@ def plot_fwhm(summary: pd.DataFrame, out_path: Path) -> None:
             sqt_v    = sqrt_t_reference(t_smooth, fwhm_v[mid_idx], temps[mid_idx])
             ax.plot(t_smooth, sqt_v, "k--", linewidth=1.2, alpha=0.6,
                     label=r"$\sqrt{T}$ scaling")
-        ax.set_xlabel(f"EC Temperature (°C)  [HL = {HL_TEMP_FIXED}°C]")
+        ax.set_xlabel(f"HL Temperature (°C)  [EC = {EC_TEMP_FIXED}°C]")
         ax.set_ylabel("Voigt FWHM (MHz)")
-        ax.set_title(f"Total Voigt Linewidth vs EC Temp ({PRIMARY_ISOTOPE})")
-        set_ec_xticks(ax, temps)
+        ax.set_title(f"Total Voigt Linewidth vs HL Temp ({PRIMARY_ISOTOPE})")
+        set_hl_xticks(ax, temps)
         ax.set_ylim(bottom=0)
         ax.legend()
         ax.grid(True, alpha=0.3, linestyle=":")
@@ -443,17 +432,17 @@ def plot_overview(summary: pd.DataFrame, out_path: Path) -> None:
     """2x2 overview panel: OD, density, Gaussian FWHM, Voigt FWHM."""
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        temps = summary["ec_temp"].values
+        temps = summary["hl_temp"].values
 
         def _eb(ax, y_col, e_col, color, ylabel, title):
             y = summary[y_col].values
             e = summary[e_col].values
             ax.errorbar(temps, y, yerr=e, fmt="o-", capsize=4,
                         color=color, linewidth=1.5, label=PRIMARY_ISOTOPE)
-            ax.set_xlabel("EC Temperature (°C)")
+            ax.set_xlabel("HL Temperature (°C)")
             ax.set_ylabel(ylabel)
             ax.set_title(title)
-            set_ec_xticks(ax, temps)
+            set_hl_xticks(ax, temps)
             ax.grid(True, alpha=0.3, linestyle=":")
             ax.legend(fontsize=8)
 
@@ -478,10 +467,10 @@ def plot_overview(summary: pd.DataFrame, out_path: Path) -> None:
             sqt      = sqrt_t_reference(t_smooth, fwhm_g[mid_idx], temps[mid_idx])
             ax.plot(t_smooth, sqt, "k--", linewidth=1.2, alpha=0.6,
                     label=r"$\sqrt{T}$ scaling")
-        ax.set_xlabel("EC Temperature (°C)")
+        ax.set_xlabel("HL Temperature (°C)")
         ax.set_ylabel("Gaussian FWHM (MHz)")
         ax.set_title(f"Gaussian Linewidth — {PRIMARY_ISOTOPE}")
-        set_ec_xticks(ax, temps)
+        set_hl_xticks(ax, temps)
         ax.set_ylim(bottom=0)
         ax.grid(True, alpha=0.3, linestyle=":")
         ax.legend(fontsize=8)
@@ -498,15 +487,15 @@ def plot_overview(summary: pd.DataFrame, out_path: Path) -> None:
             sqt_v    = sqrt_t_reference(t_smooth, fwhm_v_ov[mid_idx], temps[mid_idx])
             ax.plot(t_smooth, sqt_v, "k--", linewidth=1.2, alpha=0.6,
                     label=r"$\sqrt{T}$ scaling")
-        ax.set_xlabel("EC Temperature (°C)")
+        ax.set_xlabel("HL Temperature (°C)")
         ax.set_ylabel("Voigt FWHM (MHz)")
         ax.set_title(f"Total Voigt Linewidth — {PRIMARY_ISOTOPE}")
-        set_ec_xticks(ax, temps)
+        set_hl_xticks(ax, temps)
         ax.set_ylim(bottom=0)
         ax.grid(True, alpha=0.3, linestyle=":")
         ax.legend(fontsize=8)
 
-        fig.suptitle(f"EC Temperature Sweep — HL Fixed = {HL_TEMP_FIXED}°C",
+        fig.suptitle(f"HL Temperature Sweep — EC Fixed = {EC_TEMP_FIXED}°C",
                      fontsize=13, fontweight="bold", y=1.01)
         fig.tight_layout()
         fig.savefig(out_path, bbox_inches="tight")
@@ -525,12 +514,12 @@ def main():
     print(f"Total analysed datasets found: {len(all_datasets)}")
 
     # --- Discovery mode ---
-    if not EC_SWEEP_DATASETS:
+    if not HL_SWEEP_DATASETS:
         discovery_report(all_datasets)
         return
 
     # --- Filter to include list ---
-    include_flat = {ts for tss in EC_SWEEP_DATASETS.values() for ts in tss}
+    include_flat = {ts for tss in HL_SWEEP_DATASETS.values() for ts in tss}
     selected = [ds for ds in all_datasets if ds["timestamp"] in include_flat]
 
     # Warn about any requested timestamps not found on disk
@@ -540,14 +529,14 @@ def main():
             print(f"  WARNING: requested timestamp {ts} not found under {ACQ_FOLDER}")
 
     print(f"\nSelected {len(selected)} datasets across "
-          f"{len(EC_SWEEP_DATASETS)} temperature points\n")
+          f"{len(HL_SWEEP_DATASETS)} temperature points\n")
 
     # --- Load and quality-check ---
     results = []
-    print(f"{'Dataset':<45} {'EC':>5} {'Jitter':>8} {'FWHM_G':>8} {'OD':>8}  Status")
+    print(f"{'Dataset':<45} {'HL':>5} {'Jitter':>8} {'FWHM_G':>8} {'OD':>8}  Status")
     print("-" * 95)
 
-    for ds in sorted(selected, key=lambda d: (d["ec_temp"], d["timestamp"])):
+    for ds in sorted(selected, key=lambda d: (d["hl_temp"], d["timestamp"])):
         r = load_fit_results(ds)
         if r is None:
             continue
@@ -558,7 +547,7 @@ def main():
         j = r.get("jitter_mhz", float("nan"))
         f = r.get("fwhm_g",     float("nan"))
         o = r.get("od",         float("nan"))
-        print(f"  {ds['stem']:<43} {r['ec_temp']:>5}°C "
+        print(f"  {ds['stem']:<43} {r['hl_temp']:>5}°C "
               f"{j:>7.1f}MHz {f:>7.1f}MHz {o:>10.5f}  {status}")
         results.append(r)
 
@@ -569,23 +558,23 @@ def main():
     # --- Average by temperature ---
     summary = average_by_temp(results)
 
-    print(f"\n{'EC Temp':>8}  {'N':>3}  {'OD_mean':>10}  {'OD_std':>9}  "
+    print(f"\n{'HL Temp':>8}  {'N':>3}  {'OD_mean':>10}  {'OD_std':>9}  "
           f"{'FWHM_G_mean':>12}  {'FWHM_G_std':>11}")
     print("-" * 70)
     for _, row in summary.iterrows():
-        print(f"  {int(row['ec_temp']):>6}°C  {int(row['n_datasets']):>3}  "
+        print(f"  {int(row['hl_temp']):>6}°C  {int(row['n_datasets']):>3}  "
               f"{row['od_mean']:>10.5f}  {row['od_std']:>9.5f}  "
               f"{row['fwhm_g_mean']:>12.2f}  {row['fwhm_g_std']:>11.2f}")
 
     # --- Save CSV ---
-    csv_path = OUTPUT_DIR / "ec_sweep_summary.csv"
+    csv_path = OUTPUT_DIR / "hl_sweep_summary.csv"
     summary.to_csv(csv_path, index=False)
     print(f"\nSummary CSV saved: {csv_path}")
 
     # --- Plots ---
-    plot_od(summary,       OUTPUT_DIR / "ec_sweep_od_plot.png")
-    plot_fwhm(summary,     OUTPUT_DIR / "ec_sweep_fwhm_plot.png")
-    plot_overview(summary, OUTPUT_DIR / "ec_sweep_overview.png")
+    plot_od(summary,       OUTPUT_DIR / "hl_sweep_od_plot.png")
+    plot_fwhm(summary,     OUTPUT_DIR / "hl_sweep_fwhm_plot.png")
+    plot_overview(summary, OUTPUT_DIR / "hl_sweep_overview.png")
 
     print("\nDone.")
 
